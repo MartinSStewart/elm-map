@@ -1,9 +1,10 @@
 module MapViewer exposing
-    ( init, update, view, subscriptions, resizeCanvas, Model, Msg(..), OutMsg(..)
+    ( init, initMapData, update, view, subscriptions, resizeCanvas, Model(..), MapData(..), Msg(..), OutMsg(..)
     , MapboxAccessToken, mapboxAccessToken, mapboxAccessTokenToString
     , defaultStyle, Style, Color
     , animateZoom, animateZoomAt, animateViewBounds, withPositionAndZoom, viewPosition, viewZoom, viewportHeight, camera, lngLatToWorld, canvasToWorld, canvasSize, DevicePixels, CanvasCoordinates, WorldCoordinates
     , attribution, loadTile
+    , GeomType(..), GridPoint, PointerEvent, Value(..), ZoomAnimation(..), decodeRoadGeometryV1, decodeRoadGeometryV2, decodeWaterGeometryV2, getTags, roadLabelMeshV2, styleToInternal, withViewBounds
     )
 
 {-|
@@ -13,7 +14,7 @@ module MapViewer exposing
 
 In order for the map viewer to work correctly, make sure all of these functions are called in the appropriate places within your app.
 
-@docs init, update, view, subscriptions, resizeCanvas, Model, Msg, OutMsg
+@docs init, initMapData, update, view, subscriptions, resizeCanvas, Model, MapData, Msg, OutMsg
 
 
 # Authentication
@@ -46,6 +47,7 @@ import Axis2d
 import Axis3d
 import Bitwise
 import BoundingBox2d exposing (BoundingBox2d)
+import Browser.Events
 import Bytes exposing (Bytes)
 import Bytes.Decode as Decode
 import Bytes.Encode
@@ -55,14 +57,6 @@ import Dict as RegularDict
 import Direction2d exposing (Direction2d)
 import Direction3d
 import Duration
-import Effect.Browser.Events
-import Effect.Command as Command exposing (Command, FrontendOnly)
-import Effect.Http as Http
-import Effect.Process as Process
-import Effect.Subscription as Subscription exposing (Subscription)
-import Effect.Task as Task
-import Effect.Time as Time
-import Effect.WebGL as WebGL exposing (Mesh, Shader)
 import Font exposing (Font, Glyph)
 import Geometry.Interop.LinearAlgebra.Point2d as Point2d
 import Html exposing (Html)
@@ -70,27 +64,31 @@ import Html.Attributes
 import Html.Events.Extra.Pointer
 import Html.Events.Extra.Touch exposing (Touch)
 import Html.Events.Extra.Wheel
+import Http
 import Int64 exposing (Int64)
 import List.Extra as List
 import List.Nonempty exposing (Nonempty(..))
 import LngLat exposing (LngLat)
 import Math.Matrix4 exposing (Mat4)
-import Math.Vector2 as Vec2 exposing (Vec2)
 import Math.Vector3 as Vec3 exposing (Vec3)
 import Math.Vector4 as Vec4 exposing (Vec4)
 import Pixels exposing (Pixels)
 import Point2d exposing (Point2d)
 import Point3d
 import Polyline2d
+import Process
 import ProtobufDecode exposing (Decoder)
 import Quantity exposing (Quantity(..), Unitless)
 import Random
 import Random.List
 import Rectangle2d exposing (Rectangle2d)
+import Task
+import Time
 import TriangularMesh exposing (TriangularMesh)
 import Url.Builder
 import Vector2d exposing (Vector2d)
 import Viewpoint3d
+import WebGL exposing (Shader)
 import WebGL.Matrices
 import WebGL.Settings
 import WebGL.Settings.Blend
@@ -98,6 +96,7 @@ import WebGL.Settings.StencilTest
 import ZoomLevel exposing (ZoomLevel)
 
 
+{-| -}
 type DevicePixels
     = DevicePixel Never
 
@@ -136,8 +135,7 @@ mapboxAccessTokenToString (MapboxAccessToken a) =
 {-| -}
 type Model
     = Model
-        { data : Dict GridPoint TileState
-        , viewPosition : Point2d Unitless WorldCoordinates
+        { viewPosition : Point2d Unitless WorldCoordinates
         , viewZoom : ZoomLevel
         , zoomAnimation : Maybe ZoomAnimation
         , pointerIsDown : Maybe { dragDistance : Quantity Float Pixels }
@@ -146,7 +144,15 @@ type Model
         , devicePixelRatio : Float
         , lastAnimationFrame : Maybe Time.Posix
         , tileLoadDebounceCounter : Int
-        , style : InternalStyle
+        , debouncePending : Bool
+        , tileLoadPending : Bool
+        }
+
+
+type MapData
+    = MapData
+        { style : InternalStyle
+        , data : Dict GridPoint TileState
         }
 
 
@@ -428,28 +434,33 @@ type alias Style =
 
 
 init :
-    MapboxAccessToken
-    -> Style
-    -> LngLat
+    LngLat
     -> ZoomLevel
     -> Float
     -> ( Quantity Int Pixels, Quantity Int Pixels )
-    -> ( Model, Command restriction toMsg Msg )
-init accessToken style position startingZoom devicePixelRatio_ canvasSize_ =
-    { data = Dict.empty
-    , viewPosition = lngLatToWorld position
-    , viewZoom = startingZoom
-    , zoomAnimation = Nothing
-    , pointerIsDown = Nothing
-    , touches = RegularDict.empty
-    , canvasSize = canvasSize_
-    , devicePixelRatio = devicePixelRatio_
-    , lastAnimationFrame = Nothing
-    , tileLoadDebounceCounter = 0
-    , style = styleToInternal style
-    }
-        |> Model
-        |> loadMissingTiles accessToken
+    -> Model
+init position startingZoom devicePixelRatio canvasSize_ =
+    Model
+        { viewPosition = lngLatToWorld position
+        , viewZoom = startingZoom
+        , zoomAnimation = Nothing
+        , pointerIsDown = Nothing
+        , touches = RegularDict.empty
+        , canvasSize = canvasSize_
+        , devicePixelRatio = devicePixelRatio
+        , lastAnimationFrame = Nothing
+        , tileLoadDebounceCounter = 0
+        , debouncePending = False
+        , tileLoadPending = True
+        }
+
+
+initMapData : Style -> MapData
+initMapData style =
+    MapData
+        { style = styleToInternal style
+        , data = Dict.empty
+        }
 
 
 {-| Smoothly zoom in by a certain amount.
@@ -464,7 +475,7 @@ init accessToken style position startingZoom devicePixelRatio_ canvasSize_ =
     Map.zoomIn -1 map
 
 -}
-animateZoom : Float -> Model -> ( Model, Command restriction toMsg Msg )
+animateZoom : Float -> Model -> Model
 animateZoom zoomAmount (Model model) =
     { model
         | zoomAnimation =
@@ -473,14 +484,14 @@ animateZoom zoomAmount (Model model) =
                 , zoomLevel = ZoomLevel.toLogZoom model.viewZoom + zoomAmount |> ZoomLevel.fromLogZoom
                 }
                 |> Just
+        , debouncePending = True
     }
         |> Model
-        |> loadMissingWithDebounce
 
 
 {-| Smoothly zoom in by a certain amount while keeping a specific point on the map fixed in place. You can imagine this as zooming in at the point under your cursor.
 -}
-animateZoomAt : Point2d Unitless WorldCoordinates -> Float -> Model -> ( Model, Command restriction toMsg Msg )
+animateZoomAt : Point2d Unitless WorldCoordinates -> Float -> Model -> Model
 animateZoomAt position zoomAmount (Model model) =
     { model
         | zoomAnimation =
@@ -489,41 +500,82 @@ animateZoomAt position zoomAmount (Model model) =
                 , zoomLevel = ZoomLevel.toLogZoom model.viewZoom + zoomAmount |> ZoomLevel.fromLogZoom
                 }
                 |> Just
+        , debouncePending = True
     }
         |> Model
-        |> loadMissingWithDebounce
 
 
 {-| Set the view position and zoom level without any animation. This will end any ongoing view animation.
 -}
-withPositionAndZoom : Point2d Unitless WorldCoordinates -> ZoomLevel -> Model -> ( Model, Command restriction toMsg Msg )
+withPositionAndZoom : Point2d Unitless WorldCoordinates -> ZoomLevel -> Model -> Model
 withPositionAndZoom position zoomLevel (Model model) =
     { model
         | viewPosition = position
         , viewZoom = zoomLevel
         , zoomAnimation = Nothing
+        , debouncePending = True
     }
         |> Model
-        |> loadMissingWithDebounce
 
 
-{-| Smoothly adjust the zoom and view position so that the map fits within the given bounds.
--}
-animateViewBounds :
+withViewBounds :
     { left : Int, right : Int, top : Int, bottom : Int }
     -> LngLat
     -> LngLat
     -> Model
-    -> ( Model, Command restriction toMsg Msg )
-animateViewBounds { left, right, top, bottom } a b (Model model) =
+    -> Model
+withViewBounds padding point0 point1 (Model model) =
+    let
+        viewBoundsHelper_ =
+            viewBoundsHelper padding point0 point1 (Model model)
+    in
+    { model
+        | zoomAnimation = Nothing
+        , viewZoom = viewBoundsHelper_.viewZoom
+        , viewPosition = viewBoundsHelper_.viewPosition
+        , debouncePending = True
+    }
+        |> Model
+
+
+{-| Smoothly adjust the zoom and view position so that the map fits within the given bounds.
+-}
+animateViewBounds : { left : Int, right : Int, top : Int, bottom : Int } -> LngLat -> LngLat -> Model -> Model
+animateViewBounds padding point0 point1 (Model model) =
+    let
+        viewBoundsHelper_ =
+            viewBoundsHelper padding point0 point1 (Model model)
+    in
+    { model
+        | zoomAnimation =
+            PanAndZoom
+                { zoomAtStart = model.viewPosition
+                , zoomAtEnd = viewBoundsHelper_.viewPosition
+                , startTime = Nothing
+                , zoomLevelStart = model.viewZoom
+                , zoomLevelEnd = viewBoundsHelper_.viewZoom
+                }
+                |> Just
+        , debouncePending = True
+    }
+        |> Model
+
+
+viewBoundsHelper :
+    { left : Int, right : Int, top : Int, bottom : Int }
+    -> LngLat
+    -> LngLat
+    -> Model
+    -> { viewPosition : Point2d Unitless WorldCoordinates, viewZoom : ZoomLevel }
+viewBoundsHelper { left, right, top, bottom } point0 point1 (Model model) =
     let
         pointA : Point2d Unitless WorldCoordinates
         pointA =
-            lngLatToWorld a
+            lngLatToWorld point0
 
         pointB : Point2d Unitless WorldCoordinates
         pointB =
-            lngLatToWorld b
+            lngLatToWorld point1
 
         center : Point2d Unitless WorldCoordinates
         center =
@@ -578,34 +630,19 @@ animateViewBounds { left, right, top, bottom } a b (Model model) =
                     )
                 )
     in
-    { model
-        | zoomAnimation =
-            PanAndZoom
-                { zoomAtStart = model.viewPosition
-                , zoomAtEnd = Point2d.translateBy centerOffset center
-                , startTime = Nothing
-                , zoomLevelStart = model.viewZoom
-                , zoomLevelEnd = zoomLevelEnd
-                }
-                |> Just
+    { viewPosition = Point2d.translateBy centerOffset center
+    , viewZoom = zoomLevelEnd
     }
-        |> Model
-        |> loadMissingWithDebounce
 
 
 {-| Subscriptions the map listens for. You need to make sure this is wired up with the rest of your app in order for the map to work.
 -}
-subscriptions : Model -> Subscription FrontendOnly Msg
-subscriptions (Model model) =
-    Subscription.batch
-        [ case model.zoomAnimation of
-            Just zoomingAt ->
-                Effect.Browser.Events.onAnimationFrame (ZoomAtAnimation zoomingAt)
-
-            _ ->
-                Subscription.none
-        , if
-            Dict.toList model.data
+subscriptions : MapData -> Model -> Sub Msg
+subscriptions (MapData mapData) (Model model) =
+    let
+        unrenderedTilesExist : Bool
+        unrenderedTilesExist =
+            Dict.toList mapData.data
                 |> List.any
                     (\( _, tile ) ->
                         case tile of
@@ -624,11 +661,19 @@ subscriptions (Model model) =
                             TileError ->
                                 False
                     )
-          then
-            Effect.Browser.Events.onAnimationFrame (\_ -> NextRenderStep)
+    in
+    Sub.batch
+        [ case model.zoomAnimation of
+            Just zoomingAt ->
+                Browser.Events.onAnimationFrame (ZoomAtAnimation zoomingAt)
+
+            _ ->
+                Sub.none
+        , if unrenderedTilesExist || model.tileLoadPending || model.debouncePending then
+            Browser.Events.onAnimationFrame (\_ -> NextRenderStep)
 
           else
-            Subscription.none
+            Sub.none
         ]
 
 
@@ -703,16 +748,16 @@ gridInsideRegion region gridPoint =
         region
 
 
-loadMissingWithDebounce : Model -> ( Model, Command restriction toMsg Msg )
+loadMissingWithDebounce : Model -> ( Model, Cmd Msg )
 loadMissingWithDebounce (Model model) =
     ( Model { model | tileLoadDebounceCounter = model.tileLoadDebounceCounter + 1 }
-    , Process.sleep (Duration.milliseconds 300)
+    , Process.sleep 300
         |> Task.perform (\() -> DebounceFinished (model.tileLoadDebounceCounter + 1))
     )
 
 
-loadMissingTiles : MapboxAccessToken -> Model -> ( Model, Command restriction toMsg Msg )
-loadMissingTiles accessToken (Model model) =
+loadMissingTiles : MapboxAccessToken -> MapData -> Model -> ( MapData, Cmd Msg )
+loadMissingTiles accessToken (MapData mapData) (Model model) =
     let
         zoomAndPosition =
             targetZoomAndPosition (Model model)
@@ -765,7 +810,7 @@ loadMissingTiles accessToken (Model model) =
             List.range minGridPoint.gridY maxGridPoint.gridY
 
         list =
-            Dict.toList model.data
+            Dict.toList mapData.data
 
         ( priorityTiles, newTiles ) =
             List.partition
@@ -781,7 +826,7 @@ loadMissingTiles accessToken (Model model) =
                 list
 
         model2 =
-            { model
+            { mapData
                 | data =
                     Random.step
                         (Random.List.choices 100 newTiles)
@@ -814,16 +859,16 @@ loadMissingTiles accessToken (Model model) =
         |> List.foldl
             (\gridPoint ( model3, cmd ) ->
                 ( { model3 | data = Dict.insert gridPoint TileLoading model3.data }
-                , Command.batch [ cmd, loadTile accessToken (GotData gridPoint) gridPoint ]
+                , Cmd.batch [ cmd, loadTile accessToken (GotData gridPoint) gridPoint ]
                 )
             )
-            ( model2, Command.none )
-        |> Tuple.mapFirst Model
+            ( model2, Cmd.none )
+        |> Tuple.mapFirst MapData
 
 
 {-| Load a mapbox vector tile which you can then add to the map with `Map.update (Map.GotData loadTileResult) map`. You probably won't need to use this as the map automatically load tiles as needed.
 -}
-loadTile : MapboxAccessToken -> (Result Http.Error Bytes -> msg) -> GridPoint -> Command restriction toMsg msg
+loadTile : MapboxAccessToken -> (Result Http.Error Bytes -> msg) -> GridPoint -> Cmd msg
 loadTile accessToken onLoad position =
     Http.get
         { url =
@@ -991,44 +1036,50 @@ scaleLinearly scalar zoomLevel =
 update :
     MapboxAccessToken
     -> Maybe Font
+    -> MapData
     -> Msg
     -> Model
-    -> ( Model, Maybe OutMsg, Command restriction toMsg Msg )
-update accessToken maybeFont msg (Model model) =
+    -> { newModel : Model, newMapData : MapData, outMsg : Maybe OutMsg, cmd : Cmd Msg }
+update accessToken maybeFont (MapData mapData) msg (Model model) =
     case msg of
         GotData position result ->
-            ( { model
-                | data =
-                    Dict.insert
-                        position
-                        (case result of
-                            Ok bytes ->
-                                TileLoadedRaw bytes
+            { newModel = Model model
+            , newMapData =
+                { mapData
+                    | data =
+                        Dict.insert
+                            position
+                            (case result of
+                                Ok bytes ->
+                                    TileLoadedRaw bytes
 
-                            Err _ ->
-                                TileError
-                        )
-                        model.data
-              }
-                |> Model
-            , Nothing
-            , Command.none
-            )
+                                Err _ ->
+                                    TileError
+                            )
+                            mapData.data
+                }
+                    |> MapData
+            , outMsg = Nothing
+            , cmd = Cmd.none
+            }
 
         PointerDown event ->
-            ( { model
-                | pointerIsDown = Just { dragDistance = Quantity.zero }
-                , touches =
-                    RegularDict.insert event.pointerId event.position model.touches
-              }
-                |> Model
-            , PointerPressed
-                { canvasPosition = event.position
-                , worldPosition = canvasToWorld (Model model) event.position
+            { newModel =
+                { model
+                    | pointerIsDown = Just { dragDistance = Quantity.zero }
+                    , touches =
+                        RegularDict.insert event.pointerId event.position model.touches
                 }
-                |> Just
-            , Command.none
-            )
+                    |> Model
+            , newMapData = MapData mapData
+            , outMsg =
+                PointerPressed
+                    { canvasPosition = event.position
+                    , worldPosition = canvasToWorld (Model model) event.position
+                    }
+                    |> Just
+            , cmd = Cmd.none
+            }
 
         PointerUp event ->
             let
@@ -1036,37 +1087,45 @@ update accessToken maybeFont msg (Model model) =
                     { model | touches = RegularDict.remove event.pointerId model.touches }
             in
             if RegularDict.isEmpty model2.touches then
-                ( Model { model2 | pointerIsDown = Nothing }
-                , case model2.pointerIsDown of
-                    Just mouseDown ->
-                        PointerReleased
-                            { canvasPosition = event.position
-                            , worldPosition = canvasToWorld (Model model) event.position
-                            , dragDistance = mouseDown.dragDistance
-                            }
-                            |> Just
+                { newModel = Model { model2 | pointerIsDown = Nothing }
+                , newMapData = MapData mapData
+                , outMsg =
+                    case model2.pointerIsDown of
+                        Just mouseDown ->
+                            PointerReleased
+                                { canvasPosition = event.position
+                                , worldPosition = canvasToWorld (Model model) event.position
+                                , dragDistance = mouseDown.dragDistance
+                                }
+                                |> Just
 
-                    Nothing ->
-                        Nothing
-                , Command.none
-                )
+                        Nothing ->
+                            Nothing
+                , cmd = Cmd.none
+                }
 
             else
-                ( Model model2, Nothing, Command.none )
+                { newModel = Model model2
+                , newMapData = MapData mapData
+                , outMsg = Nothing
+                , cmd = Cmd.none
+                }
 
         PointerLeave event ->
             let
                 model2 =
                     { model | touches = RegularDict.remove event.pointerId model.touches }
             in
-            ( if RegularDict.isEmpty model2.touches then
-                Model { model2 | pointerIsDown = Nothing }
+            { newModel =
+                if RegularDict.isEmpty model2.touches then
+                    Model { model2 | pointerIsDown = Nothing }
 
-              else
-                Model model2
-            , Nothing
-            , Command.none
-            )
+                else
+                    Model model2
+            , newMapData = MapData mapData
+            , outMsg = Nothing
+            , cmd = Cmd.none
+            }
 
         MouseWheelMoved event ->
             if abs event.deltaY < 20 then
@@ -1092,7 +1151,7 @@ update accessToken maybeFont msg (Model model) =
                             |> Model
                             |> loadMissingWithDebounce
                 in
-                ( model2, Nothing, cmd )
+                { newModel = model2, newMapData = MapData mapData, outMsg = Nothing, cmd = cmd }
 
             else
                 let
@@ -1120,122 +1179,142 @@ update accessToken maybeFont msg (Model model) =
                             |> Model
                             |> loadMissingWithDebounce
                 in
-                ( model2, Nothing, cmd )
+                { newModel = model2, newMapData = MapData mapData, outMsg = Nothing, cmd = cmd }
 
         ZoomAtAnimation zoomingAt time ->
-            ( case zoomingAt of
-                ZoomInOrOut zoomInOrOut ->
-                    let
-                        zoom =
-                            ZoomLevel.toLinearZoom model.viewZoom
-
-                        targetZoom =
-                            ZoomLevel.toLinearZoom zoomInOrOut.zoomLevel
-
-                        zoomSpeed =
-                            1.1
-                    in
-                    if zoom * zoomSpeed > targetZoom && zoom / zoomSpeed < targetZoom then
+            { newModel =
+                case zoomingAt of
+                    ZoomInOrOut zoomInOrOut ->
                         let
-                            newPositionAndZoom : { position : Point2d Unitless WorldCoordinates, zoom : ZoomLevel }
-                            newPositionAndZoom =
-                                zoomAt zoomInOrOut.zoomAt (targetZoom / zoom) (Model model)
+                            zoom =
+                                ZoomLevel.toLinearZoom model.viewZoom
+
+                            targetZoom =
+                                ZoomLevel.toLinearZoom zoomInOrOut.zoomLevel
+
+                            zoomSpeed =
+                                1.1
                         in
-                        { model
-                            | lastAnimationFrame = Just time
-                            , viewZoom = zoomInOrOut.zoomLevel
-                            , viewPosition = newPositionAndZoom.position
-                            , zoomAnimation = Nothing
-                        }
-                            |> Model
-
-                    else
-                        let
-                            newPositionAndZoom : { position : Point2d Unitless WorldCoordinates, zoom : ZoomLevel }
-                            newPositionAndZoom =
-                                zoomAt
-                                    zoomInOrOut.zoomAt
-                                    (if zoom < targetZoom then
-                                        zoomSpeed
-
-                                     else
-                                        1 / zoomSpeed
-                                    )
-                                    (Model model)
-                        in
-                        { model
-                            | lastAnimationFrame = Just time
-                            , viewZoom = newPositionAndZoom.zoom
-                            , viewPosition = newPositionAndZoom.position
-                        }
-                            |> Model
-
-                PanAndZoom panAndZoom ->
-                    case panAndZoom.startTime of
-                        Just startTime ->
+                        if zoom * zoomSpeed > targetZoom && zoom / zoomSpeed < targetZoom then
                             let
-                                zoomDuration =
-                                    ZoomLevel.toLogZoom panAndZoom.zoomLevelStart
-                                        - ZoomLevel.toLogZoom panAndZoom.zoomLevelEnd
-                                        |> abs
-                                        |> logBase 2
-                                        |> (*) 0.6
-                                        |> max 0.5
-                                        |> Duration.seconds
-
-                                panDuration =
-                                    Point2d.distanceFrom panAndZoom.zoomAtStart panAndZoom.zoomAtEnd
-                                        |> Quantity.toFloat
-                                        |> (*) 100
-                                        |> sqrt
-                                        |> max 0.5
-                                        |> Duration.seconds
-
-                                duration =
-                                    Quantity.max zoomDuration panDuration
-
-                                t =
-                                    Quantity.ratio (Duration.from startTime time) duration
-                                        |> clamp 0 1
-
-                                newZoomLevel =
-                                    ((ZoomLevel.toLogZoom panAndZoom.zoomLevelEnd - startZoom) * t + startZoom)
-                                        |> ZoomLevel.fromLogZoom
-
-                                startZoom =
-                                    ZoomLevel.toLogZoom panAndZoom.zoomLevelStart
-
-                                endZoom =
-                                    ZoomLevel.toLogZoom panAndZoom.zoomLevelEnd
-
-                                t2 =
-                                    1 - (2 ^ ((startZoom - endZoom) * t)) * (1 - t)
+                                newPositionAndZoom : { position : Point2d Unitless WorldCoordinates, zoom : ZoomLevel }
+                                newPositionAndZoom =
+                                    zoomAt zoomInOrOut.zoomAt (targetZoom / zoom) (Model model)
                             in
                             { model
-                                | zoomAnimation =
-                                    if t >= 1 then
-                                        Nothing
-
-                                    else
-                                        PanAndZoom panAndZoom |> Just
-                                , viewPosition =
-                                    Point2d.interpolateFrom panAndZoom.zoomAtStart panAndZoom.zoomAtEnd t2
-                                , viewZoom = newZoomLevel
+                                | lastAnimationFrame = Just time
+                                , viewZoom = zoomInOrOut.zoomLevel
+                                , viewPosition = newPositionAndZoom.position
+                                , zoomAnimation = Nothing
                             }
                                 |> Model
 
-                        Nothing ->
+                        else
+                            let
+                                newPositionAndZoom : { position : Point2d Unitless WorldCoordinates, zoom : ZoomLevel }
+                                newPositionAndZoom =
+                                    zoomAt
+                                        zoomInOrOut.zoomAt
+                                        (if zoom < targetZoom then
+                                            zoomSpeed
+
+                                         else
+                                            1 / zoomSpeed
+                                        )
+                                        (Model model)
+                            in
                             { model
-                                | zoomAnimation = PanAndZoom { panAndZoom | startTime = Just time } |> Just
+                                | lastAnimationFrame = Just time
+                                , viewZoom = newPositionAndZoom.zoom
+                                , viewPosition = newPositionAndZoom.position
                             }
                                 |> Model
-            , Nothing
-            , Command.none
-            )
+
+                    PanAndZoom panAndZoom ->
+                        case panAndZoom.startTime of
+                            Just startTime ->
+                                let
+                                    zoomDuration =
+                                        ZoomLevel.toLogZoom panAndZoom.zoomLevelStart
+                                            - ZoomLevel.toLogZoom panAndZoom.zoomLevelEnd
+                                            |> abs
+                                            |> logBase 2
+                                            |> (*) 0.6
+                                            |> max 0.5
+                                            |> Duration.seconds
+
+                                    panDuration =
+                                        Point2d.distanceFrom panAndZoom.zoomAtStart panAndZoom.zoomAtEnd
+                                            |> Quantity.toFloat
+                                            |> (*) 100
+                                            |> sqrt
+                                            |> max 0.5
+                                            |> Duration.seconds
+
+                                    duration =
+                                        Quantity.max zoomDuration panDuration
+
+                                    t =
+                                        Quantity.ratio (Duration.from startTime time) duration
+                                            |> clamp 0 1
+
+                                    newZoomLevel =
+                                        ((ZoomLevel.toLogZoom panAndZoom.zoomLevelEnd - startZoom) * t + startZoom)
+                                            |> ZoomLevel.fromLogZoom
+
+                                    startZoom =
+                                        ZoomLevel.toLogZoom panAndZoom.zoomLevelStart
+
+                                    endZoom =
+                                        ZoomLevel.toLogZoom panAndZoom.zoomLevelEnd
+
+                                    t2 =
+                                        1 - (2 ^ ((startZoom - endZoom) * t)) * (1 - t)
+                                in
+                                { model
+                                    | zoomAnimation =
+                                        if t >= 1 then
+                                            Nothing
+
+                                        else
+                                            PanAndZoom panAndZoom |> Just
+                                    , viewPosition =
+                                        Point2d.interpolateFrom panAndZoom.zoomAtStart panAndZoom.zoomAtEnd t2
+                                    , viewZoom = newZoomLevel
+                                }
+                                    |> Model
+
+                            Nothing ->
+                                { model
+                                    | zoomAnimation = PanAndZoom { panAndZoom | startTime = Just time } |> Just
+                                }
+                                    |> Model
+            , newMapData = MapData mapData
+            , outMsg = Nothing
+            , cmd = Cmd.none
+            }
 
         NextRenderStep ->
+            let
+                model2 =
+                    { model | debouncePending = False, tileLoadPending = False }
+
+                ( Model model3, cmd ) =
+                    if model.debouncePending then
+                        loadMissingWithDebounce (Model model2)
+
+                    else
+                        ( Model model2, Cmd.none )
+
+                ( MapData mapData2, cmd2 ) =
+                    if model.tileLoadPending then
+                        loadMissingTiles accessToken (MapData mapData) (Model model3)
+
+                    else
+                        ( MapData mapData, Cmd.none )
+            in
             case
-                Dict.toList model.data
+                Dict.toList mapData2.data
                     |> List.filterMap
                         (\( coord, tile ) ->
                             case tile of
@@ -1249,25 +1328,37 @@ update accessToken maybeFont msg (Model model) =
                 ( coord, bytes ) :: _ ->
                     let
                         a =
-                            case Decode.decode (tileDecoder model.style coord (Bytes.width bytes)) bytes of
+                            case Decode.decode (tileDecoder mapData2.style coord (Bytes.width bytes)) bytes of
                                 Just value ->
                                     TileLoaded value
 
                                 Nothing ->
                                     TileError
                     in
-                    ( Model { model | data = Dict.insert coord a model.data }, Nothing, Command.none )
+                    { newModel = Model model3
+                    , newMapData = MapData { mapData2 | data = Dict.insert coord a mapData2.data }
+                    , outMsg = Nothing
+                    , cmd = Cmd.batch [ cmd, cmd2 ]
+                    }
 
                 [] ->
                     case maybeFont of
                         Just font ->
-                            ( handleNextTileToTileText font (Model model), Nothing, Command.none )
+                            { newModel = Model model3
+                            , newMapData = handleNextTileToTileText model3.devicePixelRatio font (MapData mapData2)
+                            , outMsg = Nothing
+                            , cmd = Cmd.batch [ cmd, cmd2 ]
+                            }
 
                         Nothing ->
-                            ( Model model, Nothing, Command.none )
+                            { newModel = Model model3
+                            , newMapData = MapData mapData2
+                            , outMsg = Nothing
+                            , cmd = Cmd.batch [ cmd, cmd2 ]
+                            }
 
         TouchStart ->
-            ( Model model, Nothing, Command.none )
+            { newModel = Model model, newMapData = MapData mapData, outMsg = Nothing, cmd = Cmd.none }
 
         PointerMoved event ->
             let
@@ -1365,29 +1456,29 @@ update accessToken maybeFont msg (Model model) =
                                 |> loadMissingWithDebounce
 
                         _ ->
-                            ( Model model2, Command.none )
+                            ( Model model2, Cmd.none )
             in
-            ( model3, Nothing, cmd )
+            { newModel = model3, newMapData = MapData mapData, outMsg = Nothing, cmd = cmd }
 
         DebounceFinished counter ->
             if counter == model.tileLoadDebounceCounter then
                 let
-                    ( model2, cmd ) =
-                        loadMissingTiles accessToken (Model model)
+                    ( mapData2, cmd ) =
+                        loadMissingTiles accessToken (MapData mapData) (Model model)
                 in
-                ( model2, Nothing, cmd )
+                { newModel = Model model, newMapData = mapData2, outMsg = Nothing, cmd = cmd }
 
             else
-                ( Model model, Nothing, Command.none )
+                { newModel = Model model, newMapData = MapData mapData, outMsg = Nothing, cmd = Cmd.none }
 
         TouchMoved ->
-            ( Model model, Nothing, Command.none )
+            { newModel = Model model, newMapData = MapData mapData, outMsg = Nothing, cmd = Cmd.none }
 
 
-handleNextTileToTileText : Font -> Model -> Model
-handleNextTileToTileText font (Model model) =
+handleNextTileToTileText : Float -> Font -> MapData -> MapData
+handleNextTileToTileText devicePixelRatio font (MapData mapData) =
     case
-        Dict.toList model.data
+        Dict.toList mapData.data
             |> List.filterMap
                 (\( coord, tile ) ->
                     case tile of
@@ -1411,7 +1502,7 @@ handleNextTileToTileText font (Model model) =
                                 case
                                     Dict.get
                                         { gridX = coord.gridX + x, gridY = coord.gridY + y, zoom = coord.zoom }
-                                        model.data
+                                        mapData.data
                                 of
                                     Just (TileLoadedWithText neighborTile) ->
                                         Just neighborTile
@@ -1427,19 +1518,19 @@ handleNextTileToTileText font (Model model) =
                             )
                             { roadLabelChars = [], placeLabelChars = [] }
             in
-            { model
+            { mapData
                 | data =
                     Dict.insert
                         coord
-                        (tileToTileWithText model.style model.devicePixelRatio font neighbors coord tile
+                        (tileToTileWithText mapData.style devicePixelRatio font neighbors coord tile
                             |> TileLoadedWithText
                         )
-                        model.data
+                        mapData.data
             }
-                |> Model
+                |> MapData
 
         [] ->
-            Model model
+            MapData mapData
 
 
 clientPosToScreen : { a | offsetPos : ( Float, Float ) } -> Point2d Pixels CanvasCoordinates
@@ -1485,11 +1576,9 @@ resizeCanvas :
     Float
     -> ( Quantity Int Pixels, Quantity Int Pixels )
     -> Model
-    -> ( Model, Command restriction toMsg Msg )
+    -> Model
 resizeCanvas devicePixelRatio_ canvasSize_ (Model model) =
-    { model | canvasSize = canvasSize_, devicePixelRatio = devicePixelRatio_ }
-        |> Model
-        |> loadMissingWithDebounce
+    Model { model | canvasSize = canvasSize_, devicePixelRatio = devicePixelRatio_, debouncePending = True }
 
 
 {-| Returns the size of the canvas in css pixels and in device pixels. If your device pixel ratio is 1 then these values are the same. If the device pixel ratio is 2 then the device pixel canvas size will be twice as large as the css pixel canvas size.
@@ -1536,8 +1625,8 @@ canvasSize (Model model) =
 
 {-| Draw the map! You can add additional layers on top of the map as well though for now this isn't easy to do unless you are well versed in how to use `elm-explorations/webgl`. The plan is to add helper functions in a future version of this package that make it easier.
 -}
-view : List WebGL.Entity -> Model -> Html Msg
-view extraLayers (Model model) =
+view : List WebGL.Entity -> MapData -> Model -> Html Msg
+view extraLayers (MapData mapData) (Model model) =
     let
         ( cssWindowWidth, cssWindowHeight ) =
             perfectSize.canvasSize
@@ -1574,7 +1663,7 @@ view extraLayers (Model model) =
         visibleBounds =
             visibleRegion_ (Model model)
 
-        drawRoad : Bool -> { a | roadLayer : Mesh RoadVertex } -> Float -> Mat4 -> WebGL.Entity
+        drawRoad : Bool -> { a | roadLayer : WebGL.Mesh RoadVertex } -> Float -> Mat4 -> WebGL.Entity
         drawRoad isOutline tile relativeZoom matrix =
             WebGL.entityWith
                 [ WebGL.Settings.cullFace WebGL.Settings.back ]
@@ -1599,7 +1688,7 @@ view extraLayers (Model model) =
 
         visibleTiles : List (List VisibleTile)
         visibleTiles =
-            Dict.toList model.data
+            Dict.toList mapData.data
                 |> List.filterMap
                     (\( position, result ) ->
                         let
@@ -1612,7 +1701,7 @@ view extraLayers (Model model) =
                             isVisible =
                                 List.any
                                     (\childPosition ->
-                                        gridInsideRegion visibleBounds childPosition && not (Dict.member childPosition model.data)
+                                        gridInsideRegion visibleBounds childPosition && not (Dict.member childPosition mapData.data)
                                     )
                                     [ { zoom = position.zoom + 1, gridX = gridX2, gridY = gridY2 + 1 }
                                     , { zoom = position.zoom + 1, gridX = gridX2 + 1, gridY = gridY2 + 1 }
@@ -1659,10 +1748,10 @@ view extraLayers (Model model) =
                 (\{ matrix, result } ->
                     case result of
                         TileLoaded tile ->
-                            drawLayer False matrix model.style.water tile.waterLayer
+                            drawLayer False matrix mapData.style.water tile.waterLayer
 
                         TileLoadedWithText tile ->
-                            drawLayer False matrix model.style.water tile.waterLayer
+                            drawLayer False matrix mapData.style.water tile.waterLayer
 
                         TileError ->
                             []
@@ -1681,10 +1770,10 @@ view extraLayers (Model model) =
                 (\{ matrix, result } ->
                     case result of
                         TileLoaded tile ->
-                            drawLayer False matrix model.style.nature tile.natureLayer
+                            drawLayer False matrix mapData.style.nature tile.natureLayer
 
                         TileLoadedWithText tile ->
-                            drawLayer False matrix model.style.nature tile.natureLayer
+                            drawLayer False matrix mapData.style.nature tile.natureLayer
 
                         TileError ->
                             []
@@ -1703,10 +1792,10 @@ view extraLayers (Model model) =
                 (\{ matrix, result } ->
                     case result of
                         TileLoaded tile ->
-                            drawLayer False matrix model.style.buildings tile.buildingLayer
+                            drawLayer False matrix mapData.style.buildings tile.buildingLayer
 
                         TileLoadedWithText tile ->
-                            drawLayer False matrix model.style.buildings tile.buildingLayer
+                            drawLayer False matrix mapData.style.buildings tile.buildingLayer
 
                         TileError ->
                             []
@@ -1730,7 +1819,7 @@ view extraLayers (Model model) =
                                 vertexShader
                                 fragmentShader
                                 square
-                                { color = model.style.ground
+                                { color = mapData.style.ground
                                 , matrix = matrix
                                 }
                             ]
@@ -1741,7 +1830,7 @@ view extraLayers (Model model) =
                                 vertexShader
                                 fragmentShader
                                 square
-                                { color = model.style.ground
+                                { color = mapData.style.ground
                                 , matrix = matrix
                                 }
                             ]
@@ -1844,10 +1933,10 @@ view extraLayers (Model model) =
     WebGL.toHtmlWith
         [ WebGL.stencil 0
         , WebGL.clearColor
-            (Vec4.getX model.style.background)
-            (Vec4.getY model.style.background)
-            (Vec4.getZ model.style.background)
-            (Vec4.getW model.style.background)
+            (Vec4.getX mapData.style.background)
+            (Vec4.getY mapData.style.background)
+            (Vec4.getZ mapData.style.background)
+            (Vec4.getW mapData.style.background)
         , WebGL.antialias
         ]
         ([ Html.Attributes.width (Quantity.unwrap (Tuple.first perfectSize.devicePixelCanvasSize))
@@ -1890,7 +1979,7 @@ eventToPointerEvent msg event =
     msg { pointerId = event.pointerId, position = clientPosToScreen event.pointer }
 
 
-drawLayer : Bool -> Mat4 -> Vec4 -> Mesh Vertex -> List WebGL.Entity
+drawLayer : Bool -> Mat4 -> Vec4 -> WebGL.Mesh Vertex -> List WebGL.Entity
 drawLayer invertFill matrix color mesh =
     [ WebGL.entityWith
         [ WebGL.Settings.StencilTest.test
@@ -1936,35 +2025,36 @@ drawLayer invertFill matrix color mesh =
     ]
 
 
-viewportSquare : Mesh { position : Vec2 }
+viewportSquare : WebGL.Mesh Vertex
 viewportSquare =
     WebGL.triangleFan
-        [ { position = Vec2.vec2 -1 -1 }
-        , { position = Vec2.vec2 1 -1 }
-        , { position = Vec2.vec2 1 1 }
-        , { position = Vec2.vec2 -1 1 }
+        [ { x = -1, y = -1 }
+        , { x = 1, y = -1 }
+        , { x = 1, y = 1 }
+        , { x = -1, y = 1 }
         ]
 
 
-square : Mesh { position : Vec2 }
+square : WebGL.Mesh Vertex
 square =
     WebGL.triangleFan
-        [ { position = Vec2.vec2 0 0 }
-        , { position = Vec2.vec2 1 0 }
-        , { position = Vec2.vec2 1 1 }
-        , { position = Vec2.vec2 0 1 }
+        [ { x = 0, y = 0 }
+        , { x = 1, y = 0 }
+        , { x = 1, y = 1 }
+        , { x = 0, y = 1 }
         ]
 
 
-vertexShader : Shader { position : Vec2 } { a | matrix : Mat4 } {}
+vertexShader : Shader Vertex { a | matrix : Mat4 } {}
 vertexShader =
     [glsl|
 
-attribute vec2 position;
+attribute float x;
+attribute float y;
 uniform mat4 matrix;
 
 void main () {
-  gl_Position = matrix * vec4(position, 0.0, 1.0);
+  gl_Position = matrix * vec4(vec2(x, y), 0.0, 1.0);
 }
 
 |]
@@ -1986,15 +2076,17 @@ labelVertexShader : Shader LabelVertex { a | matrix : Mat4, offsetScale : Float 
 labelVertexShader =
     [glsl|
 
-attribute vec2 position;
-attribute vec2 offset;
+attribute float positionX;
+attribute float positionY;
+attribute float offsetX;
+attribute float offsetY;
 attribute vec3 color;
 uniform mat4 matrix;
 uniform float offsetScale;
 varying vec3 color2;
 
 void main () {
-  gl_Position = matrix * vec4(position + offset * offsetScale, 0.0, 1.0);
+  gl_Position = matrix * vec4(vec2(positionX, positionY) + vec2(offsetX, offsetY) * offsetScale, 0.0, 1.0);
   color2 = color;
 }
 
@@ -2004,8 +2096,10 @@ void main () {
 roadVertexShader : Shader RoadVertex { a | matrix : Mat4, isOutline : Float, offsetScale : Float } { color2 : Vec3 }
 roadVertexShader =
     [glsl|
-attribute vec2 position;
-attribute vec2 offset;
+attribute float positionX;
+attribute float positionY;
+attribute float offsetX;
+attribute float offsetY;
 attribute vec3 color;
 attribute vec3 outlineColor;
 uniform mat4 matrix;
@@ -2014,7 +2108,7 @@ uniform float offsetScale;
 varying vec3 color2;
 
 void main () {
-  gl_Position = matrix * vec4(position + (isOutline == 1.0 ? 1.0 : 0.7) * offset * offsetScale, 0.0, 1.0);
+  gl_Position = matrix * vec4(vec2(positionX, positionY) + (isOutline == 1.0 ? 1.0 : 0.7) * vec2(offsetX, offsetY) * offsetScale, 0.0, 1.0);
   color2 = isOutline == 1.0 ? outlineColor : color;
 }
 
@@ -2026,7 +2120,7 @@ roadFragmentShader =
     [glsl|
         precision mediump float;
         varying vec3 color2;
-        
+
         void main () {
             gl_FragColor = vec4(color2, 1.0);
         }
@@ -2200,15 +2294,15 @@ type alias LayerTemp =
 
 
 type alias Vertex =
-    { position : Vec2 }
+    { x : Float, y : Float }
 
 
 type alias RoadVertex =
-    { position : Vec2, offset : Vec2, color : Vec3, outlineColor : Vec3 }
+    { positionX : Float, positionY : Float, offsetX : Float, offsetY : Float, color : Vec3, outlineColor : Vec3 }
 
 
 type alias LabelVertex =
-    { position : Vec2, offset : Vec2, color : Vec3 }
+    { positionX : Float, positionY : Float, offsetX : Float, offsetY : Float, color : Vec3 }
 
 
 type alias LandcoverBuilder =
@@ -2240,7 +2334,7 @@ type alias PlaceLabelBuilder =
 
 
 type alias TextVertex =
-    { position : Vec2, offset : Vec2, color : Vec3 }
+    { positionX : Float, positionY : Float, offsetX : Float, offsetY : Float, color : Vec3 }
 
 
 type alias Road =
@@ -2398,44 +2492,23 @@ valueDecoder =
         ]
 
 
-decodeWaterGeometry : FeatureTemp -> Maybe (WebGL.Mesh Vertex)
-decodeWaterGeometry feature =
-    Decode.map
-        (\geometry ->
-            let
-                geometry_ =
-                    List.map (List.map (\p -> { position = Point2d.toVec2 p })) geometry
-            in
-            List.foldl
-                (\vertices ( offset, indices ) ->
-                    let
-                        length =
-                            List.length vertices
-                    in
-                    ( offset + length
-                    , indexVertices offset length :: indices
-                    )
-                )
-                ( 0, [] )
-                geometry_
-                |> Tuple.second
-                |> List.reverse
-                |> List.concat
-                |> WebGL.indexedTriangles (List.concat geometry_)
-        )
-        (geometryDecoder feature.type_ (Bytes.width feature.mesh))
-        |> (\decoder -> Decode.decode decoder feature.mesh)
+decodeWaterGeometryV2 : { a | type_ : GeomType, mesh : Bytes } -> Maybe (WebGL.Mesh Vertex)
+decodeWaterGeometryV2 feature =
+    Decode.decode
+        (geometryDecoderV2 (Bytes.width feature.mesh))
+        feature.mesh
 
 
 decodeLandcoverGeometry : LayerTemp -> FeatureTemp -> LandcoverBuilder -> LandcoverBuilder
 decodeLandcoverGeometry layer feature builder =
-    case getTags layer feature |> RegularDict.get "class" of
+    case getTagsV2 layer feature "class" of
         Just (StringValue "grass") ->
             Decode.map
                 (\geometry ->
                     let
+                        geometry_ : List (List Vertex)
                         geometry_ =
-                            List.map (List.map (\p -> { position = Point2d.toVec2 p })) geometry
+                            List.map (List.map Point2d.unwrap) geometry
                     in
                     List.foldl
                         (\vertices builder2 ->
@@ -2451,7 +2524,7 @@ decodeLandcoverGeometry layer feature builder =
                         builder
                         geometry_
                 )
-                (geometryDecoder feature.type_ (Bytes.width feature.mesh))
+                (geometryDecoder (Bytes.width feature.mesh))
                 |> (\decoder ->
                         case Decode.decode decoder feature.mesh of
                             Just newBuilder ->
@@ -2470,8 +2543,9 @@ decodeBuildingGeometry feature builder =
     Decode.map
         (\geometry ->
             let
+                geometry_ : List (List Vertex)
                 geometry_ =
-                    List.map (List.map (\p -> { position = Point2d.toVec2 p })) geometry
+                    List.map (List.map Point2d.unwrap) geometry
             in
             List.foldl
                 (\vertices builder2 ->
@@ -2487,7 +2561,7 @@ decodeBuildingGeometry feature builder =
                 builder
                 geometry_
         )
-        (geometryDecoder feature.type_ (Bytes.width feature.mesh))
+        (geometryDecoder (Bytes.width feature.mesh))
         |> (\decoder ->
                 case Decode.decode decoder feature.mesh of
                     Just newBuilder ->
@@ -2498,7 +2572,7 @@ decodeBuildingGeometry feature builder =
            )
 
 
-getTags : LayerTemp -> FeatureTemp -> RegularDict.Dict String Value
+getTags : { a | keys : Array String, values : Array Value } -> { b | tags : List Int } -> RegularDict.Dict String Value
 getTags layer feature =
     List.groupsOf 2 feature.tags
         |> List.map
@@ -2522,15 +2596,380 @@ getTags layer feature =
         |> RegularDict.fromList
 
 
-decodeRoadGeometry : InternalStyle -> RoadBuilder -> LayerTemp -> FeatureTemp -> RoadBuilder
-decodeRoadGeometry style roadBuilder layer feature =
+arrayFindIndex : (a -> Bool) -> Array a -> Maybe Int
+arrayFindIndex isEqual array =
+    arrayFindIndexHelper isEqual array 0
+
+
+arrayFindIndexHelper : (a -> Bool) -> Array a -> Int -> Maybe Int
+arrayFindIndexHelper isEqual array index =
+    case Array.get index array of
+        Just value ->
+            if isEqual value then
+                Just index
+
+            else
+                arrayFindIndexHelper isEqual array (index + 1)
+
+        Nothing ->
+            Nothing
+
+
+getTagsV2 : { a | keys : Array String, values : Array Value } -> { b | tags : List Int } -> String -> Maybe Value
+getTagsV2 layer feature key =
+    case arrayFindIndex ((==) key) layer.keys of
+        Just index ->
+            case getValueFromTag index feature.tags of
+                Just value ->
+                    Array.get value layer.values
+
+                Nothing ->
+                    Nothing
+
+        Nothing ->
+            Nothing
+
+
+getValueFromTag : Int -> List Int -> Maybe Int
+getValueFromTag tagIndex tags =
+    case tags of
+        key :: value :: rest ->
+            if key == tagIndex then
+                Just value
+
+            else
+                getValueFromTag tagIndex rest
+
+        _ ->
+            Nothing
+
+
+bytesToList : Bytes -> List Int
+bytesToList bytes =
+    Decode.decode
+        (Decode.loop
+            ( Bytes.width bytes, [] )
+            (\( count, list ) ->
+                if count == 0 then
+                    Decode.Done (List.reverse list) |> Decode.succeed
+
+                else
+                    Decode.unsignedInt8
+                        |> Decode.map (\value -> Decode.Loop ( count - 1, value :: list ))
+            )
+        )
+        bytes
+        |> Maybe.withDefault []
+
+
+decodeRoadGeometryV2 :
+    InternalStyle
+    -> RoadBuilder
+    -> { a | keys : Array String, values : Array Value }
+    -> FeatureTemp
+    -> RoadBuilder
+decodeRoadGeometryV2 style roadBuilder layer feature =
     let
+        maybeName : Maybe String
+        maybeName =
+            case getTagsV2 layer feature "name" of
+                Just (StringValue value) ->
+                    Just value
+
+                _ ->
+                    Nothing
+
+        maybeRoadData : Maybe { color : Vec3, outlineColor : Vec3, width : Float, alwaysDrawLabel : Bool }
+        maybeRoadData =
+            case getTagsV2 layer feature "type" of
+                Just (StringValue value) ->
+                    case value of
+                        "primary" ->
+                            { color = style.primaryRoad
+                            , outlineColor = style.primaryRoadOutline
+                            , width = 0.005
+                            , alwaysDrawLabel = True
+                            }
+                                |> Just
+
+                        "primary_link" ->
+                            { color = style.primaryRoadLink
+                            , outlineColor = style.primaryRoadLinkOutline
+                            , width = 0.0025
+                            , alwaysDrawLabel = True
+                            }
+                                |> Just
+
+                        "secondary" ->
+                            { color = style.secondaryRoad
+                            , outlineColor = style.secondaryRoadOutline
+                            , width = 0.004
+                            , alwaysDrawLabel = True
+                            }
+                                |> Just
+
+                        "secondary_link" ->
+                            { color = style.secondaryRoadLink
+                            , outlineColor = style.secondaryRoadLinkOutline
+                            , width = 0.002
+                            , alwaysDrawLabel = True
+                            }
+                                |> Just
+
+                        "tertiary" ->
+                            { color = style.tertiaryRoad
+                            , outlineColor = style.tertiaryRoadOutline
+                            , width = 0.003
+                            , alwaysDrawLabel = True
+                            }
+                                |> Just
+
+                        "tertiary_link" ->
+                            { color = style.tertiaryRoadLink
+                            , outlineColor = style.tertiaryRoadLinkOutline
+                            , width = 0.0015
+                            , alwaysDrawLabel = True
+                            }
+                                |> Just
+
+                        "residential" ->
+                            { color = style.residentialRoad
+                            , outlineColor = style.residentialRoadOutline
+                            , width = 0.002
+                            , alwaysDrawLabel = True
+                            }
+                                |> Just
+
+                        "motorway" ->
+                            { color = style.motorway
+                            , outlineColor = style.motorwayOutline
+                            , width = 0.005
+                            , alwaysDrawLabel = True
+                            }
+                                |> Just
+
+                        "motorway_link" ->
+                            { color = style.motorwayLink
+                            , outlineColor = style.motorwayLinkOutline
+                            , width = 0.0025
+                            , alwaysDrawLabel = True
+                            }
+                                |> Just
+
+                        "road" ->
+                            { color = style.road
+                            , outlineColor = style.roadOutline
+                            , width = 0.001
+                            , alwaysDrawLabel = False
+                            }
+                                |> Just
+
+                        "trunk" ->
+                            { color = style.trunkRoad
+                            , outlineColor = style.trunkRoadOutline
+                            , width = 0.005
+                            , alwaysDrawLabel = True
+                            }
+                                |> Just
+
+                        "trunk_link" ->
+                            { color = style.trunkRoadLink
+                            , outlineColor = style.trunkRoadLinkOutline
+                            , width = 0.0025
+                            , alwaysDrawLabel = True
+                            }
+                                |> Just
+
+                        "pedestrian" ->
+                            { color = style.pedestrianPath
+                            , outlineColor = style.pedestrianPathOutline
+                            , width = 0.002
+                            , alwaysDrawLabel = False
+                            }
+                                |> Just
+
+                        "unclassified" ->
+                            { color = style.unclassifiedRoad
+                            , outlineColor = style.unclassifiedRoadOutline
+                            , width = 0.002
+                            , alwaysDrawLabel = False
+                            }
+                                |> Just
+
+                        "platform" ->
+                            { color = style.platform
+                            , outlineColor = style.platformOutline
+                            , width = 0.002
+                            , alwaysDrawLabel = True
+                            }
+                                |> Just
+
+                        "rail" ->
+                            { color = style.railroad
+                            , outlineColor = style.railroadOutline
+                            , width = 0.0005
+                            , alwaysDrawLabel = False
+                            }
+                                |> Just
+
+                        "tram" ->
+                            { color = style.tramline
+                            , outlineColor = style.tramlineOutline
+                            , width = 0.0004
+                            , alwaysDrawLabel = False
+                            }
+                                |> Just
+
+                        "subway" ->
+                            { color = style.subway
+                            , outlineColor = style.subwayOutline
+                            , width = 0.0004
+                            , alwaysDrawLabel = False
+                            }
+                                |> Just
+
+                        "narrow_gauge" ->
+                            { color = style.narrowGaugeRailroad
+                            , outlineColor = style.narrowGaugeRailroadOutline
+                            , width = 0.0004
+                            , alwaysDrawLabel = False
+                            }
+                                |> Just
+
+                        "trail" ->
+                            { color = style.trail
+                            , outlineColor = style.trailOutline
+                            , width = 0.0004
+                            , alwaysDrawLabel = False
+                            }
+                                |> Just
+
+                        "footway" ->
+                            { color = style.footway
+                            , outlineColor = style.footwayOutline
+                            , width = 0.0004
+                            , alwaysDrawLabel = False
+                            }
+                                |> Just
+
+                        "living_street" ->
+                            { color = style.livingStreet
+                            , outlineColor = style.livingStreetOutline
+                            , width = 0.001
+                            , alwaysDrawLabel = False
+                            }
+                                |> Just
+
+                        "service" ->
+                            { color = style.serviceRoad
+                            , outlineColor = style.serviceRoadOutline
+                            , width = 0.001
+                            , alwaysDrawLabel = False
+                            }
+                                |> Just
+
+                        --"track" ->
+                        --    Nothing
+                        --
+                        --"level_crossing" ->
+                        --    Nothing
+                        --
+                        --"ferry" ->
+                        --    Nothing
+                        --
+                        --"ferry_auto" ->
+                        --    Nothing
+                        --
+                        --"footway" ->
+                        --    Nothing
+                        --
+                        --"steps" ->
+                        --    Nothing
+                        --
+                        --"sidewalk" ->
+                        --    Nothing
+                        --
+                        --"crossing" ->
+                        --    Nothing
+                        --
+                        --"cycleway" ->
+                        --    Nothing
+                        --
+                        --"traffic_signals" ->
+                        --    Nothing
+                        --
+                        --"turning_circle" ->
+                        --    Nothing
+                        --
+                        --"mini_roundabout" ->
+                        --    Nothing
+                        --
+                        --"turning_loop" ->
+                        --    Nothing
+                        _ ->
+                            Nothing
+
+                --name ->
+                --    let
+                --        _ =
+                --            Debug.log "" name
+                --    in
+                --    { color = Vec3.vec3 1 0 0
+                --    , outlineColor = style.serviceRoadOutline
+                --    , width = 0.001
+                --    , alwaysDrawLabel = False
+                --    }
+                --        |> Just
+                _ ->
+                    Nothing
+    in
+    case maybeRoadData of
+        Just roadData ->
+            Decode.map
+                (decodeRoadGeometryHelper roadBuilder roadData maybeName)
+                (geometryDecoder (Bytes.width feature.mesh))
+                |> (\decoder -> Decode.decode decoder feature.mesh)
+                |> Maybe.withDefault roadBuilder
+
+        Nothing ->
+            roadBuilder
+
+
+decodeRoadGeometryV1 :
+    InternalStyle
+    -> RoadBuilder
+    -> { a | keys : Array String, values : Array Value }
+    -> FeatureTemp
+    -> RoadBuilder
+decodeRoadGeometryV1 style roadBuilder layer feature =
+    let
+        --_ =
+        --    Debug.log ""
+        --        ( { keys = layer.keys, values = layer.values }
+        --        , { tags = feature.tags
+        --          , mesh =
+        --                Decode.decode
+        --                    (Decode.loop
+        --                        ( Bytes.width feature.mesh, [] )
+        --                        (\( count, list ) ->
+        --                            if count == 0 then
+        --                                Decode.Done (List.reverse list) |> Decode.succeed
+        --
+        --                            else
+        --                                Decode.unsignedInt8
+        --                                    |> Decode.map (\value -> Decode.Loop ( count - 1, value :: list ))
+        --                        )
+        --                    )
+        --                    feature.mesh
+        --          , type_ = feature.type_
+        --          }
+        --        )
         tags =
             getTags layer feature
 
         maybeName : Maybe String
         maybeName =
-            case RegularDict.get "name_local" tags of
+            case RegularDict.get "name" tags of
                 Just (StringValue value) ->
                     Just value
 
@@ -2785,7 +3224,7 @@ decodeRoadGeometry style roadBuilder layer feature =
         Just roadData ->
             Decode.map
                 (decodeRoadGeometryHelper roadBuilder roadData maybeName)
-                (geometryDecoder feature.type_ (Bytes.width feature.mesh))
+                (geometryDecoder (Bytes.width feature.mesh))
                 |> (\decoder -> Decode.decode decoder feature.mesh)
                 |> Maybe.withDefault roadBuilder
 
@@ -2854,7 +3293,7 @@ placeLabelGlyphRadius devicePixelRatio font zoom class =
         |> Quantity.float
 
 
-roadLabelMesh :
+roadLabelMeshV2 :
     InternalStyle
     -> Float
     -> Font
@@ -2864,7 +3303,7 @@ roadLabelMesh :
     -> Nonempty (Point2d Unitless Unitless)
     -> String
     -> Maybe { mesh : TriangularMesh LabelVertex, newGlyphs : List (Point2d Unitless WorldCoordinates) }
-roadLabelMesh style devicePixelRatio font tilePosition newGlyphs existingChars path text =
+roadLabelMeshV2 style devicePixelRatio font tilePosition newGlyphs existingChars path text =
     let
         glyphs : List Glyph
         glyphs =
@@ -2890,35 +3329,37 @@ roadLabelMesh style devicePixelRatio font tilePosition newGlyphs existingChars p
         pathLength_ : Quantity Float Unitless
         pathLength_ =
             pathLength path
-
-        startAt : Quantity Float Unitless
-        startAt =
-            pathLength_ |> Quantity.minus width |> Quantity.multiplyBy 0.5
-
-        center =
-            moveAlongPath
-                (Quantity.plus (Quantity.multiplyBy 0.5 width) startAt)
-                path
-                |> .position
-
-        start =
-            moveAlongPath startAt path
-
-        path_ =
-            if
-                Direction2d.toVector start.direction
-                    |> Vector2d.xComponent
-                    |> Quantity.greaterThanZero
-            then
-                path
-
-            else
-                List.Nonempty.reverse path
     in
     if pathLength_ |> Quantity.lessThan width then
         Nothing
 
     else
+        let
+            centerPosition =
+                moveAlongPathV2
+                    (Quantity.plus (Quantity.multiplyBy 0.5 width) startAt)
+                    path
+                    |> .position
+                    |> Point2d.unwrap
+
+            startAt : Quantity Float Unitless
+            startAt =
+                pathLength_ |> Quantity.minus width |> Quantity.multiplyBy 0.5
+
+            start =
+                moveAlongPathV2 startAt path
+
+            path_ =
+                if
+                    Direction2d.toVector start.direction
+                        |> Vector2d.xComponent
+                        |> Quantity.greaterThanZero
+                then
+                    path
+
+                else
+                    List.Nonempty.reverse path
+        in
         List.foldl
             (\glyph state ->
                 if state.isTooCurvy then
@@ -2927,29 +3368,38 @@ roadLabelMesh style devicePixelRatio font tilePosition newGlyphs existingChars p
                 else
                     let
                         { position, direction } =
-                            moveAlongPath (toFloat state.offset / roadGlyphScale |> Quantity.float |> Quantity.plus startAt) path_
+                            moveAlongPathV2 (toFloat state.offset / roadGlyphScale |> Quantity.float |> Quantity.plus startAt) path_
                     in
                     if Direction2d.angleFrom start.direction direction |> Quantity.abs |> Quantity.lessThan (Angle.degrees 45) then
                         { list =
                             TriangularMesh.mapVertices
                                 (\glyphPoint ->
                                     let
-                                        { x, y } =
-                                            Point2d.translateBy
-                                                (Vector2d.unitless
-                                                    (toFloat font.bboxRight / -2)
-                                                    (toFloat font.capHeight / -2)
-                                                )
-                                                glyphPoint.position
-                                                |> Point2d.scaleAbout Point2d.origin (1 / roadGlyphScale)
-                                                |> Point2d.mirrorAcross Axis2d.x
-                                                |> Point2d.rotateAround Point2d.origin (Direction2d.toAngle direction)
-                                                |> Point2d.translateBy (Vector2d.from Point2d.origin position)
-                                                |> Point2d.translateBy (Vector2d.from center Point2d.origin)
-                                                |> Point2d.unwrap
+                                        glyphPosition =
+                                            Point2d.toUnitless glyphPoint.position
+
+                                        position2 =
+                                            Point2d.unwrap position
+
+                                        x =
+                                            (glyphPosition.x + toFloat font.bboxRight / -2) / roadGlyphScale
+
+                                        y =
+                                            (glyphPosition.y + toFloat font.capHeight / -2) / -roadGlyphScale
+
+                                        angle =
+                                            Direction2d.toAngle direction |> Angle.inRadians
+
+                                        cos2 =
+                                            cos angle
+
+                                        sin2 =
+                                            sin angle
                                     in
-                                    { position = Point2d.toVec2 center
-                                    , offset = Vec2.vec2 x y
+                                    { positionX = centerPosition.x
+                                    , positionY = centerPosition.y
+                                    , offsetX = (cos2 * x - sin2 * y) + position2.x - centerPosition.x
+                                    , offsetY = (sin2 * x + cos2 * y) + position2.y - centerPosition.y
                                     , color =
                                         if glyphPoint.isOutline then
                                             style.roadLabelOutline
@@ -2984,7 +3434,7 @@ roadLabelMesh style devicePixelRatio font tilePosition newGlyphs existingChars p
                             && checkCollisions (roadLabelCharCollision devicePixelRatio font tilePosition.zoom) state.newGlyphs newGlyphs
                     then
                         Just
-                            { mesh = List.reverse state.list |> TriangularMesh.combine
+                            { mesh = TriangularMesh.combine state.list
                             , newGlyphs = state.newGlyphs
                             }
 
@@ -3067,8 +3517,8 @@ placeLabelMesh style devicePixelRatio font tilePosition label =
                 |> (*) offsetX
                 |> (\x -> Point2d.translateBy (Vector2d.unitless x offsetY) Point2d.origin)
 
-        labelPositionVec =
-            Point2d.toVec2 label.position
+        labelPoint =
+            Point2d.unwrap label.position
     in
     List.foldl
         (\glyph state ->
@@ -3089,8 +3539,10 @@ placeLabelMesh style devicePixelRatio font tilePosition label =
                                     |> Point2d.translateBy (Vector2d.from Point2d.origin position)
                                     |> Point2d.unwrap
                         in
-                        { position = labelPositionVec
-                        , offset = Vec2.vec2 x y
+                        { positionX = labelPoint.x
+                        , positionY = labelPoint.y
+                        , offsetX = x
+                        , offsetY = y
                         , color =
                             if glyphPoint.isOutline then
                                 style.placeLabelOutline
@@ -3117,9 +3569,9 @@ placeLabelMesh style devicePixelRatio font tilePosition label =
         )
         { list =
             if label.isCapital then
-                [ ring 10 (240 / scale) (160 / scale) labelPositionVec (Vec3.vec3 0 0 0)
-                , circle 10 (100 / scale) labelPositionVec (Vec3.vec3 0 0 0)
-                , circle 10 (280 / scale) labelPositionVec (Vec3.vec3 1 1 1)
+                [ ring 10 (240 / scale) (160 / scale) label.position (Vec3.vec3 0 0 0)
+                , circle 10 (100 / scale) label.position (Vec3.vec3 0 0 0)
+                , circle 10 (280 / scale) label.position (Vec3.vec3 1 1 1)
                 ]
 
             else
@@ -3131,13 +3583,13 @@ placeLabelMesh style devicePixelRatio font tilePosition label =
                         []
 
                     Settlement ->
-                        [ circle 10 (160 / scale) labelPositionVec (Vec3.vec3 0 0 0)
-                        , circle 10 (200 / scale) labelPositionVec (Vec3.vec3 1 1 1)
+                        [ circle 10 (160 / scale) label.position (Vec3.vec3 0 0 0)
+                        , circle 10 (200 / scale) label.position (Vec3.vec3 1 1 1)
                         ]
 
                     SettlementSubdivision ->
-                        [ circle 10 (160 / scale) labelPositionVec (Vec3.vec3 0 0 0)
-                        , circle 10 (200 / scale) labelPositionVec (Vec3.vec3 1 1 1)
+                        [ circle 10 (160 / scale) label.position (Vec3.vec3 0 0 0)
+                        , circle 10 (200 / scale) label.position (Vec3.vec3 1 1 1)
                         ]
         , offset = 0
         , newGlyphs = []
@@ -3148,9 +3600,12 @@ placeLabelMesh style devicePixelRatio font tilePosition label =
            )
 
 
-ring : Int -> Float -> Float -> Vec2 -> Vec3 -> TriangularMesh LabelVertex
+ring : Int -> Float -> Float -> Point2d a b -> Vec3 -> TriangularMesh LabelVertex
 ring detail outerRadius innerRadius position color =
     let
+        { x, y } =
+            Point2d.unwrap position
+
         outerVertices : List LabelVertex
         outerVertices =
             List.range 0 (detail - 1)
@@ -3160,8 +3615,10 @@ ring detail outerRadius innerRadius position color =
                             t =
                                 toFloat index * (2 * pi / toFloat detail)
                         in
-                        { position = position
-                        , offset = Vec2.vec2 (cos t * outerRadius) (sin t * outerRadius)
+                        { positionX = x
+                        , positionY = y
+                        , offsetX = cos t * outerRadius
+                        , offsetY = sin t * outerRadius
                         , color = color
                         }
                     )
@@ -3175,8 +3632,10 @@ ring detail outerRadius innerRadius position color =
                             t =
                                 toFloat index * (2 * pi / toFloat detail)
                         in
-                        { position = position
-                        , offset = Vec2.vec2 (cos t * innerRadius) (sin t * innerRadius)
+                        { positionX = x
+                        , positionY = y
+                        , offsetX = cos t * innerRadius
+                        , offsetY = sin t * innerRadius
                         , color = color
                         }
                     )
@@ -3200,9 +3659,12 @@ ring detail outerRadius innerRadius position color =
     TriangularMesh.indexed (innerVertices ++ outerVertices |> Array.fromList) indices
 
 
-circle : Int -> Float -> Vec2 -> Vec3 -> TriangularMesh LabelVertex
+circle : Int -> Float -> Point2d a b -> Vec3 -> TriangularMesh LabelVertex
 circle detail radius position color =
     let
+        { x, y } =
+            Point2d.unwrap position
+
         vertices : Array LabelVertex
         vertices =
             List.range 0 (detail - 1)
@@ -3212,8 +3674,10 @@ circle detail radius position color =
                             t =
                                 toFloat index * (2 * pi / toFloat detail)
                         in
-                        { position = position
-                        , offset = Vec2.vec2 (cos t * radius) (sin t * radius)
+                        { positionX = x
+                        , positionY = y
+                        , offsetX = cos t * radius
+                        , offsetY = sin t * radius
                         , color = color
                         }
                     )
@@ -3266,6 +3730,34 @@ moveAlongPath distanceAlong path =
             { position = current, direction = Direction2d.x }
 
 
+moveAlongPathV2 :
+    Quantity Float Unitless
+    -> Nonempty (Point2d Unitless Unitless)
+    -> { position : Point2d Unitless Unitless, direction : Direction2d Unitless }
+moveAlongPathV2 distanceAlong path =
+    let
+        current =
+            List.Nonempty.head path
+    in
+    case List.Nonempty.tail path of
+        next :: rest ->
+            let
+                distance : Quantity Float Unitless
+                distance =
+                    Point2d.distanceFrom current next
+            in
+            if distance |> Quantity.lessThan distanceAlong then
+                moveAlongPath (distanceAlong |> Quantity.minus distance) (Nonempty next rest)
+
+            else
+                { position = Point2d.interpolateFrom current next (Quantity.ratio distanceAlong distance)
+                , direction = Direction2d.from current next |> Maybe.withDefault Direction2d.x
+                }
+
+        [] ->
+            { position = current, direction = Direction2d.x }
+
+
 pathLength : Nonempty (Point2d Unitless Unitless) -> Quantity Float Unitless
 pathLength path =
     List.Nonempty.toList path
@@ -3287,7 +3779,7 @@ drawRoadLabels style devicePixelRatio font existingChars tilePosition textBuilde
         textBuilder
 
     else
-        case roadLabelMesh style devicePixelRatio font tilePosition textBuilder.newGlyphs existingChars road.path road.roadName of
+        case roadLabelMeshV2 style devicePixelRatio font tilePosition textBuilder.newGlyphs existingChars road.path road.roadName of
             Just { mesh, newGlyphs } ->
                 let
                     vertices : Array LabelVertex
@@ -3368,23 +3860,35 @@ decodeRoadGeometryHelper :
 decodeRoadGeometryHelper roadBuilder { width, color, outlineColor, alwaysDrawLabel } maybeName geometry =
     List.foldl
         (\lineString roadBuilder2 ->
-            case List.map (\p -> { position = Point2d.toVec2 p }) lineString of
+            case lineString of
                 first :: rest ->
                     let
                         result =
                             List.foldl
-                                (\{ position } state ->
+                                (\position state ->
                                     let
+                                        { x, y } =
+                                            Point2d.unwrap position
+
+                                        previousPoint =
+                                            Point2d.unwrap state.previous
+
                                         normal =
-                                            Vec2.sub state.previous position
-                                                |> Vec2.normalize
-                                                |> Vec2.scale width
+                                            Vector2d.from position state.previous
+                                                |> Vector2d.normalize
+                                                |> Vector2d.scaleBy width
 
                                         perpendicular =
-                                            Vec2.vec2 -(Vec2.getY normal) (Vec2.getX normal)
+                                            Vector2d.perpendicularTo normal
+
+                                        perpendicularPoint =
+                                            Vector2d.unwrap perpendicular
 
                                         negativePerpendicular =
-                                            Vec2.negate perpendicular
+                                            Vector2d.reverse perpendicular
+
+                                        negativePerpendicularPoint =
+                                            Vector2d.unwrap negativePerpendicular
 
                                         index =
                                             state.roadBuilder.index
@@ -3394,23 +3898,31 @@ decodeRoadGeometryHelper roadBuilder { width, color, outlineColor, alwaysDrawLab
                                     , path = List.Nonempty.cons position state.path
                                     , roadBuilder =
                                         { vertices =
-                                            [ { position = position
-                                              , offset = negativePerpendicular
+                                            [ { positionX = x
+                                              , positionY = y
+                                              , offsetX = negativePerpendicularPoint.x
+                                              , offsetY = negativePerpendicularPoint.y
                                               , color = color
                                               , outlineColor = outlineColor
                                               }
-                                            , { position = position
-                                              , offset = perpendicular
+                                            , { positionX = x
+                                              , positionY = y
+                                              , offsetX = perpendicularPoint.x
+                                              , offsetY = perpendicularPoint.y
                                               , color = color
                                               , outlineColor = outlineColor
                                               }
-                                            , { position = state.previous
-                                              , offset = perpendicular
+                                            , { positionX = previousPoint.x
+                                              , positionY = previousPoint.y
+                                              , offsetX = perpendicularPoint.x
+                                              , offsetY = perpendicularPoint.y
                                               , color = color
                                               , outlineColor = outlineColor
                                               }
-                                            , { position = state.previous
-                                              , offset = negativePerpendicular
+                                            , { positionX = previousPoint.x
+                                              , positionY = previousPoint.y
+                                              , offsetX = negativePerpendicularPoint.x
+                                              , offsetY = negativePerpendicularPoint.y
                                               , color = color
                                               , outlineColor = outlineColor
                                               }
@@ -3436,8 +3948,8 @@ decodeRoadGeometryHelper roadBuilder { width, color, outlineColor, alwaysDrawLab
                                     }
                                 )
                                 { isFirst = True
-                                , previous = first.position
-                                , path = Nonempty first.position []
+                                , previous = first
+                                , path = Nonempty first []
                                 , roadBuilder = roadBuilder2
                                 }
                                 rest
@@ -3448,11 +3960,15 @@ decodeRoadGeometryHelper roadBuilder { width, color, outlineColor, alwaysDrawLab
                     , roads =
                         (case maybeName of
                             Just name ->
-                                [ { roadName = name
-                                  , path = List.Nonempty.map Point2d.fromVec2 result.path
-                                  , alwaysDrawLabel = alwaysDrawLabel
-                                  }
-                                ]
+                                if String.length name > 1 then
+                                    [ { roadName = name
+                                      , path = result.path
+                                      , alwaysDrawLabel = alwaysDrawLabel
+                                      }
+                                    ]
+
+                                else
+                                    []
 
                             Nothing ->
                                 []
@@ -3484,7 +4000,7 @@ layerTempToLayer style tilePosition layer =
         "water" ->
             case layer.features of
                 first :: _ ->
-                    case decodeWaterGeometry first of
+                    case decodeWaterGeometryV2 first of
                         Just mesh ->
                             WaterLayer mesh |> Just
 
@@ -3514,7 +4030,7 @@ layerTempToLayer style tilePosition layer =
                     roadBuilder : RoadBuilder
                     roadBuilder =
                         List.foldl
-                            (\feature state -> decodeRoadGeometry style state layer feature)
+                            (\feature state -> decodeRoadGeometryV2 style state layer feature)
                             { index = 0, vertices = [], roads = [], indices = [] }
                             layer.features
                 in
@@ -3554,7 +4070,7 @@ layerTempToLayer style tilePosition layer =
                                 _ ->
                                     Nothing
                     in
-                    case ( RegularDict.get "name_local" tags, maybeClass, RegularDict.get "symbolrank" tags ) of
+                    case ( RegularDict.get "name" tags, maybeClass, RegularDict.get "symbolrank" tags ) of
                         ( Just (StringValue label), Just class, Just (Uint64Value symbolRank) ) ->
                             case Decode.decode (pointDecoder (Bytes.width feature.mesh)) feature.mesh of
                                 Just point ->
@@ -3926,8 +4442,8 @@ pointDecoder fullWidth =
         )
 
 
-geometryDecoder : GeomType -> Int -> Decode.Decoder (List (List (Point2d Unitless Unitless)))
-geometryDecoder geomType fullWidth =
+geometryDecoder : Int -> Decode.Decoder (List (List (Point2d Unitless Unitless)))
+geometryDecoder fullWidth =
     Decode.loop
         ( fullWidth
         , { penPosition = { x = 0, y = 0 }
@@ -3940,18 +4456,7 @@ geometryDecoder geomType fullWidth =
                     fullWidth_
             in
             if bytesRemaining == 0 then
-                Decode.Done
-                    (case geomType of
-                        Polygon ->
-                            model.polygons
-
-                        LineString ->
-                            model.polygons
-
-                        _ ->
-                            []
-                    )
-                    |> Decode.succeed
+                Decode.Done model.polygons |> Decode.succeed
 
             else if bytesRemaining < 0 then
                 Decode.fail
@@ -3982,6 +4487,67 @@ geometryDecoder geomType fullWidth =
                                                 ( bytesRemaining - w - bytesUsed
                                                 , { penPosition = penPosition
                                                   , polygons = polygon :: model.polygons
+                                                  }
+                                                )
+                                        )
+
+                            -- ClosePath
+                            7 ->
+                                Decode.Loop ( bytesRemaining - w, model ) |> Decode.succeed
+
+                            _ ->
+                                Decode.fail
+                    )
+                    ProtobufDecode.uint32
+        )
+
+
+geometryDecoderV2 : Int -> Decode.Decoder (WebGL.Mesh Vertex)
+geometryDecoderV2 fullWidth =
+    Decode.loop
+        ( fullWidth
+        , { penPosition = { x = 0, y = 0 }
+          , vertices = []
+          }
+        )
+        (\( fullWidth_, model ) ->
+            let
+                bytesRemaining =
+                    fullWidth_
+            in
+            if bytesRemaining == 0 then
+                WebGL.triangles model.vertices
+                    |> Decode.Done
+                    |> Decode.succeed
+
+            else if bytesRemaining < 0 then
+                Decode.fail
+
+            else
+                Decode.andThen
+                    (\( w, value ) ->
+                        case Bitwise.and 0x07 value of
+                            -- MoveTo
+                            1 ->
+                                decodeMovePenV2 model.penPosition value
+                                    |> Decode.map
+                                        (\{ bytesUsed, penPosition } ->
+                                            Decode.Loop
+                                                ( bytesRemaining - w - bytesUsed
+                                                , { penPosition = penPosition
+                                                  , vertices = model.vertices
+                                                  }
+                                                )
+                                        )
+
+                            2 ->
+                                decodePolygonParametersV2 model.vertices model.penPosition value
+                                    |> Decode.map
+                                        (\{ bytesUsed, penPosition, vertices } ->
+                                            Decode.Loop
+                                                ( bytesRemaining - w - bytesUsed
+                                                , { penPosition = penPosition
+                                                  , vertices = vertices
                                                   }
                                                 )
                                         )
@@ -4049,6 +4615,113 @@ decodePolygonParameters penPositionStart value =
                     { bytesUsed = totalBytesUsed
                     , polygon = polygon
                     , penPosition = penPosition
+                    }
+                    |> Decode.succeed
+
+            else
+                Decode.fail
+        )
+
+
+decodeMovePenV2 : { x : Int, y : Int } -> Int -> Decode.Decoder { bytesUsed : Int, penPosition : { x : Int, y : Int } }
+decodeMovePenV2 penPositionStart value =
+    Decode.loop
+        { totalBytesUsed = 0
+        , parametersLeft = Bitwise.shiftRightZfBy 3 value
+        , penPosition = penPositionStart
+        }
+        (\{ penPosition, totalBytesUsed, parametersLeft } ->
+            if parametersLeft > 0 then
+                ProtobufDecode.uint32
+                    |> Decode.andThen
+                        (\( usedBytes1, value1 ) ->
+                            ProtobufDecode.uint32
+                                |> Decode.map
+                                    (\( usedBytes2, value2 ) ->
+                                        Decode.Loop
+                                            { totalBytesUsed = usedBytes1 + usedBytes2 + totalBytesUsed
+                                            , parametersLeft = parametersLeft - 1
+                                            , penPosition =
+                                                { x = penPosition.x + ProtobufDecode.zigzagDecoder value1
+                                                , y = penPosition.y + ProtobufDecode.zigzagDecoder value2
+                                                }
+                                            }
+                                    )
+                        )
+
+            else if parametersLeft == 0 then
+                Decode.Done
+                    { bytesUsed = totalBytesUsed
+                    , penPosition = penPosition
+                    }
+                    |> Decode.succeed
+
+            else
+                Decode.fail
+        )
+
+
+decodePolygonParametersV2 :
+    List ( Vertex, Vertex, Vertex )
+    -> { x : Int, y : Int }
+    -> Int
+    ->
+        Decode.Decoder
+            { bytesUsed : Int
+            , penPosition : { x : Int, y : Int }
+            , vertices : List ( Vertex, Vertex, Vertex )
+            }
+decodePolygonParametersV2 currentVertices penPositionStart value =
+    let
+        vec : Vertex
+        vec =
+            { x = toFloat penPositionStart.x / extend
+            , y = toFloat penPositionStart.y / extend
+            }
+    in
+    Decode.loop
+        { totalBytesUsed = 0
+        , parametersLeft = Bitwise.shiftRightZfBy 3 value
+        , vertices = currentVertices
+        , penPosition = vec
+        , previousPenPosition = vec
+        }
+        (\{ penPosition, previousPenPosition, totalBytesUsed, parametersLeft, vertices } ->
+            if parametersLeft > 0 then
+                ProtobufDecode.uint32
+                    |> Decode.andThen
+                        (\( usedBytes1, value1 ) ->
+                            ProtobufDecode.uint32
+                                |> Decode.map
+                                    (\( usedBytes2, value2 ) ->
+                                        let
+                                            newPen : Vertex
+                                            newPen =
+                                                { x = penPosition.x + toFloat (ProtobufDecode.zigzagDecoder value1) / extend
+                                                , y = penPosition.y + toFloat (ProtobufDecode.zigzagDecoder value2) / extend
+                                                }
+
+                                            newVec : Vertex
+                                            newVec =
+                                                { x = newPen.x
+                                                , y = newPen.y
+                                                }
+                                        in
+                                        Decode.Loop
+                                            { totalBytesUsed = usedBytes1 + usedBytes2 + totalBytesUsed
+                                            , parametersLeft = parametersLeft - 1
+                                            , vertices = ( newVec, vec, previousPenPosition ) :: vertices
+                                            , penPosition = newPen
+                                            , previousPenPosition = newVec
+                                            }
+                                    )
+                        )
+
+            else if parametersLeft == 0 then
+                Decode.Done
+                    { bytesUsed = totalBytesUsed
+                    , vertices = vertices
+                    , penPosition = { x = round (penPosition.x * extend), y = round (penPosition.y * extend) }
                     }
                     |> Decode.succeed
 

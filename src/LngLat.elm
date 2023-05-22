@@ -1,7 +1,4 @@
-module LngLat exposing
-    ( LngLat, minimum, maximum, distance
-    , objectCodec
-    )
+module LngLat exposing (LngLat, minimum, maximum, distance)
 
 {-|
 
@@ -9,9 +6,6 @@ module LngLat exposing
 
 -}
 
-import Codec exposing (Codec)
-import Json.Decode as Decode exposing (Decoder)
-import Json.Encode as Encode exposing (Value)
 import Length exposing (Length)
 
 
@@ -82,22 +76,3 @@ distance pointA pointB =
 
 deg2rad deg =
     deg * (pi / 180)
-
-
-objectCodec : Codec LngLat
-objectCodec =
-    Codec.build encodeAsObject decodeFromObject
-
-
-{-| We can also encode as an `{lng: 32, lat: 435}` object.
--}
-encodeAsObject : LngLat -> Value
-encodeAsObject { lng, lat } =
-    Encode.object [ ( "lng", Encode.float lng ), ( "lat", Encode.float lat ) ]
-
-
-{-| We can also encode from an `{lng: 32, lat: 435}` object.
--}
-decodeFromObject : Decoder LngLat
-decodeFromObject =
-    Decode.map2 LngLat (Decode.field "lng" Decode.float) (Decode.field "lat" Decode.float)
