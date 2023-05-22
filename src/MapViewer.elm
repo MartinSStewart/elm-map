@@ -1,10 +1,10 @@
 module MapViewer exposing
-    ( init, initMapData, update, view, subscriptions, resizeCanvas, Model(..), MapData(..), Msg(..), OutMsg(..)
+    ( init, initMapData, update, view, subscriptions, resizeCanvas, Model, MapData, Msg, OutMsg(..)
     , MapboxAccessToken, mapboxAccessToken, mapboxAccessTokenToString
     , defaultStyle, Style, Color
     , animateZoom, animateZoomAt, animateViewBounds, withPositionAndZoom, viewPosition, viewZoom, viewportHeight, camera, lngLatToWorld, canvasToWorld, canvasSize, DevicePixels, CanvasCoordinates, WorldCoordinates
     , attribution, loadTile
-    , GeomType(..), GridPoint, PointerEvent, Value(..), ZoomAnimation(..), decodeRoadGeometryV1, decodeRoadGeometryV2, decodeWaterGeometryV2, getTags, roadLabelMeshV2, styleToInternal, withViewBounds
+    , GridPoint, PointerEvent, Value(..), getTags, withViewBounds
     )
 
 {-|
@@ -58,7 +58,6 @@ import Direction2d exposing (Direction2d)
 import Direction3d
 import Duration
 import Font exposing (Font, Glyph)
-import Geometry.Interop.LinearAlgebra.Point2d as Point2d
 import Html exposing (Html)
 import Html.Attributes
 import Html.Events.Extra.Pointer
@@ -82,6 +81,7 @@ import Quantity exposing (Quantity(..), Unitless)
 import Random
 import Random.List
 import Rectangle2d exposing (Rectangle2d)
+import Serialize
 import Task
 import Time
 import TriangularMesh exposing (TriangularMesh)
@@ -153,7 +153,15 @@ type MapData
     = MapData
         { style : InternalStyle
         , data : Dict GridPoint TileState
+        , font : FontState
         }
+
+
+type FontState
+    = FontNotLoading String
+    | FontLoading
+    | FontLoaded Font
+    | FontLoadFailed Http.Error
 
 
 type ZoomAnimation
@@ -188,6 +196,7 @@ type Msg
     | PointerLeave PointerEvent
     | TouchStart
     | TouchMoved
+    | GotFont (Result Http.Error Font)
 
 
 type alias PointerEvent =
@@ -455,11 +464,12 @@ init position startingZoom devicePixelRatio canvasSize_ =
         }
 
 
-initMapData : Style -> MapData
-initMapData style =
+initMapData : String -> Style -> MapData
+initMapData fontPath style =
     MapData
         { style = styleToInternal style
         , data = Dict.empty
+        , font = FontNotLoading fontPath
         }
 
 
@@ -661,6 +671,14 @@ subscriptions (MapData mapData) (Model model) =
                             TileError ->
                                 False
                     )
+
+        fontNotLoading =
+            case mapData.font of
+                FontNotLoading _ ->
+                    True
+
+                _ ->
+                    False
     in
     Sub.batch
         [ case model.zoomAnimation of
@@ -669,7 +687,7 @@ subscriptions (MapData mapData) (Model model) =
 
             _ ->
                 Sub.none
-        , if unrenderedTilesExist || model.tileLoadPending || model.debouncePending then
+        , if unrenderedTilesExist || model.tileLoadPending || model.debouncePending || fontNotLoading then
             Browser.Events.onAnimationFrame (\_ -> NextRenderStep)
 
           else
@@ -1035,12 +1053,11 @@ scaleLinearly scalar zoomLevel =
 -}
 update :
     MapboxAccessToken
-    -> Maybe Font
     -> MapData
     -> Msg
     -> Model
     -> { newModel : Model, newMapData : MapData, outMsg : Maybe OutMsg, cmd : Cmd Msg }
-update accessToken maybeFont (MapData mapData) msg (Model model) =
+update accessToken (MapData mapData) msg (Model model) =
     case msg of
         GotData position result ->
             { newModel = Model model
@@ -1062,6 +1079,22 @@ update accessToken maybeFont (MapData mapData) msg (Model model) =
             , outMsg = Nothing
             , cmd = Cmd.none
             }
+
+        GotFont result ->
+            case result of
+                Ok font ->
+                    { newModel = Model model
+                    , newMapData = MapData { mapData | font = FontLoaded font }
+                    , outMsg = Nothing
+                    , cmd = Cmd.none
+                    }
+
+                Err error ->
+                    { newModel = Model model
+                    , newMapData = MapData { mapData | font = FontLoadFailed error }
+                    , outMsg = Nothing
+                    , cmd = Cmd.none
+                    }
 
         PointerDown event ->
             { newModel =
@@ -1312,9 +1345,38 @@ update accessToken maybeFont (MapData mapData) msg (Model model) =
 
                     else
                         ( MapData mapData, Cmd.none )
+
+                mapData3 =
+                    { mapData2
+                        | font =
+                            case mapData2.font of
+                                FontNotLoading _ ->
+                                    FontLoading
+
+                                _ ->
+                                    mapData2.font
+                    }
+
+                fontCmd : Cmd Msg
+                fontCmd =
+                    case mapData2.font of
+                        FontNotLoading fontPath ->
+                            Http.get
+                                { url = fontPath
+                                , expect =
+                                    Http.expectJson
+                                        GotFont
+                                        (Serialize.getJsonDecoder identity Font.codec)
+                                }
+
+                        _ ->
+                            Cmd.none
+
+                cmds =
+                    Cmd.batch [ cmd, cmd2, fontCmd ]
             in
             case
-                Dict.toList mapData2.data
+                Dict.toList mapData3.data
                     |> List.filterMap
                         (\( coord, tile ) ->
                             case tile of
@@ -1328,7 +1390,7 @@ update accessToken maybeFont (MapData mapData) msg (Model model) =
                 ( coord, bytes ) :: _ ->
                     let
                         a =
-                            case Decode.decode (tileDecoder mapData2.style coord (Bytes.width bytes)) bytes of
+                            case Decode.decode (tileDecoder mapData3.style coord (Bytes.width bytes)) bytes of
                                 Just value ->
                                     TileLoaded value
 
@@ -1336,25 +1398,25 @@ update accessToken maybeFont (MapData mapData) msg (Model model) =
                                     TileError
                     in
                     { newModel = Model model3
-                    , newMapData = MapData { mapData2 | data = Dict.insert coord a mapData2.data }
+                    , newMapData = MapData { mapData3 | data = Dict.insert coord a mapData3.data }
                     , outMsg = Nothing
-                    , cmd = Cmd.batch [ cmd, cmd2 ]
+                    , cmd = cmds
                     }
 
                 [] ->
-                    case maybeFont of
-                        Just font ->
+                    case mapData.font of
+                        FontLoaded font ->
                             { newModel = Model model3
-                            , newMapData = handleNextTileToTileText model3.devicePixelRatio font (MapData mapData2)
+                            , newMapData = handleNextTileToTileText model3.devicePixelRatio font (MapData mapData3)
                             , outMsg = Nothing
-                            , cmd = Cmd.batch [ cmd, cmd2 ]
+                            , cmd = cmds
                             }
 
-                        Nothing ->
+                        _ ->
                             { newModel = Model model3
-                            , newMapData = MapData mapData2
+                            , newMapData = MapData mapData3
                             , outMsg = Nothing
-                            , cmd = Cmd.batch [ cmd, cmd2 ]
+                            , cmd = cmds
                             }
 
         TouchStart ->
