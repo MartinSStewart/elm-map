@@ -3507,7 +3507,8 @@ roadLabelMeshV2 style devicePixelRatio font tilePosition newGlyphs existingChars
 
 checkCollisions : (a -> b -> Bool) -> List a -> List b -> Bool
 checkCollisions intersectionFunc listA listB =
-    List.all (\a -> List.all (intersectionFunc a >> not) listB) listA
+    --List.all (\a -> List.all (intersectionFunc a >> not) listB) listA
+    not <| List.any (\a -> List.any (intersectionFunc a) listB) listA
 
 
 placeLabelMesh :
