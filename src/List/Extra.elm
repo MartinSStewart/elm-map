@@ -1,4 +1,4 @@
-module List.Extra exposing (..)
+module List.Extra exposing (find, gatherEqualsBy, gatherWith, groupsOf, groupsOfWithStep, remove, uniqueBy)
 
 {-| Since `elm-community/list-extra` changes major versions often and we only need a few functions, it's better to copy them here and add a dependency to `elm-community/list-extra`
 -}
@@ -127,3 +127,54 @@ gatherWith testFn list =
                     helper remaining (( toGather, gathering ) :: gathered)
     in
     helper list []
+
+
+{-| Remove the first occurrence of a value from a list.
+-}
+remove : a -> List a -> List a
+remove x xs =
+    removeHelp xs x xs []
+
+
+removeHelp : List a -> a -> List a -> List a -> List a
+removeHelp list x xs previousElements =
+    case xs of
+        [] ->
+            list
+
+        y :: ys ->
+            if x == y then
+                reverseAppend previousElements ys
+
+            else
+                removeHelp list x ys (y :: previousElements)
+
+
+reverseAppend : List a -> List a -> List a
+reverseAppend list1 list2 =
+    List.foldl (::) list2 list1
+
+
+{-| Drop duplicates where what is considered to be a duplicate is the result of first applying the supplied function to the elements of the list.
+-}
+uniqueBy : (a -> b) -> List a -> List a
+uniqueBy f list =
+    uniqueHelp f [] list []
+
+
+uniqueHelp : (a -> b) -> List b -> List a -> List a -> List a
+uniqueHelp f existing remaining accumulator =
+    case remaining of
+        [] ->
+            List.reverse accumulator
+
+        first :: rest ->
+            let
+                computedFirst =
+                    f first
+            in
+            if List.member computedFirst existing then
+                uniqueHelp f existing rest accumulator
+
+            else
+                uniqueHelp f (computedFirst :: existing) rest (first :: accumulator)
