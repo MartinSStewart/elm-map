@@ -18,8 +18,6 @@ Also, people I've shown the map viewer to (around half) report that it's laggy o
 
 Thanks to [realia.se](https://realia.se/) for letting me implement this during work hours!
 
-Also thanks to
-
 [^1]: This package does depend on Mapbox servers to provide vector tiles. You'll need to create an account with them and generate an API key.
 
 [^2]: Contact me on Elm slack (martin.stewart) or email me at martinsstewart@gmail.com if you like to hire me to implement a specific feature.
