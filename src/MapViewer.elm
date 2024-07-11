@@ -456,7 +456,7 @@ init position startingZoom devicePixelRatio canvasSize_ =
         , devicePixelRatio = devicePixelRatio
         , lastAnimationFrame = Nothing
         , tileLoadDebounceCounter = 0
-        , debouncePending = False
+        , debouncePending = True
         , tileLoadPending = True
         }
 

@@ -1,6 +1,8 @@
 module Main exposing (main)
 
+import Angle
 import Browser
+import CssPixels
 import Html exposing (Html)
 import Http
 import MapViewer
@@ -16,7 +18,7 @@ type Msg
     = MapMsg MapViewer.Msg
 
 
-{-| This should be safe to commit to the repo. This Mapbox API key is publically scoped which as I understand it means it's intended to be shared with the end user <https://docs.mapbox.com/help/troubleshooting/how-to-use-mapbox-securely/#access-tokens>
+{-| Documentation on how to generate your own Mapbox API: <https://docs.mapbox.com/help/troubleshooting/how-to-use-mapbox-securely/#access-tokens>
 -}
 mapboxApiKey =
     MapViewer.mapboxAccessToken "pk.eyJ1IjoiYXQxMjMxMjMxMjMiLCJhIjoiY2t0dWh2NW9rMWE0czMycWVleWJsMWNxcyJ9.rhtVgETrZT4_LboePjCCpA"
@@ -32,17 +34,25 @@ main =
         }
 
 
+{-| DPI is hardcoded in this example but you'll want to get this with JS `window.devicePixelRatio` and then pass it in with ports. If you don't do this then the map will be blurry.
+-}
+devicePixelRatio =
+    2
+
+
 init : () -> ( Model, Cmd msg )
-init flags =
+init _ =
     ( { map =
             MapViewer.init
-                { lng = 0, lat = 40 }
+                { lng = Angle.degrees 0, lat = Angle.degrees 40 }
                 (ZoomLevel.fromLogZoom 8)
-                1
-                ( Pixels.pixels 800, Pixels.pixels 600 )
+                devicePixelRatio
+                ( CssPixels.cssPixels 800, CssPixels.cssPixels 600 )
       , mapData =
             MapViewer.initMapData
-                "https://raw.githubusercontent.com/MartinSStewart/elm-map/master/public/dinProMediumEncoded.json"
+                { fntPath = "https://raw.githubusercontent.com/MartinSStewart/elm-map/master/public/dinProMedium.fnt"
+                , imagePath = "https://raw.githubusercontent.com/MartinSStewart/elm-map/master/public/dinProMedium.png"
+                }
                 MapViewer.defaultStyle
       }
     , Cmd.none
@@ -67,4 +77,4 @@ subscriptions model =
 
 view : Model -> Html Msg
 view model =
-    MapViewer.view [] model.mapData model.map |> Html.map MapMsg
+    MapViewer.view MapMsg model.mapData model.map
