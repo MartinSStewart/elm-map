@@ -6,14 +6,17 @@ module LngLat exposing (LngLat, minimum, maximum, distance)
 
 -}
 
+import Angle exposing (Angle)
 import Length exposing (Length)
+import Quantity
+import Vector3d
 
 
 {-| A LngLat represents a geographic position with longitude and latitude.
 -}
 type alias LngLat =
-    { lng : Float
-    , lat : Float
+    { lng : Angle
+    , lat : Angle
     }
 
 
@@ -21,14 +24,14 @@ type alias LngLat =
 -}
 minimum : LngLat -> LngLat -> LngLat
 minimum a b =
-    { lng = min a.lng b.lng, lat = min a.lat b.lat }
+    { lng = Quantity.min a.lng b.lng, lat = Quantity.min a.lat b.lat }
 
 
 {-| Return a new `LngLat` with the largest longitude and latitude from each.
 -}
 maximum : LngLat -> LngLat -> LngLat
 maximum a b =
-    { lng = max a.lng b.lng, lat = max a.lat b.lat }
+    { lng = Quantity.max a.lng b.lng, lat = Quantity.max a.lat b.lat }
 
 
 {-| Find the distance between two points.
@@ -49,20 +52,19 @@ distance pointA pointB =
             pointB.lng
 
         r =
-            6371
+            6371.009
 
         dLat =
-            deg2rad (lat2 - lat1)
+            Quantity.difference lat2 lat1
 
         dLon =
-            deg2rad (lon2 - lon1)
+            Quantity.difference lon2 lon1
 
         a =
-            (sin (dLat / 2) * sin (dLat / 2))
-                + (cos (deg2rad lat1)
-                    * cos (deg2rad lat2)
-                    * sin (dLon / 2)
-                    * sin (dLon / 2)
+            (Angle.sin (dLat |> Quantity.divideBy 2) ^ 2)
+                + (Angle.cos lat1
+                    * Angle.cos lat2
+                    * (Angle.sin (dLon |> Quantity.divideBy 2) ^ 2)
                   )
 
         c =
@@ -72,7 +74,3 @@ distance pointA pointB =
             r * c
     in
     Length.kilometers d
-
-
-deg2rad deg =
-    deg * (pi / 180)

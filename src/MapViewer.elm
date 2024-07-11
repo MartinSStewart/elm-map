@@ -1,10 +1,10 @@
 module MapViewer exposing
     ( init, initMapData, update, view, subscriptions, resizeCanvas, Model, MapData, Msg, OutMsg(..)
     , MapboxAccessToken, mapboxAccessToken, mapboxAccessTokenToString
-    , defaultStyle, Style, Color
-    , animateZoom, animateZoomAt, animateViewBounds, withPositionAndZoom, viewPosition, viewZoom, viewportHeight, camera, lngLatToWorld, canvasToWorld, canvasSize, DevicePixels, CanvasCoordinates, WorldCoordinates
+    , defaultStyle, rgb, Style, Color
+    , animateZoom, animateZoomAt, animateViewBounds, withPositionAndZoom, viewPosition, viewZoom, viewportHeight, camera, lngLatToWorld, canvasToWorld, canvasSize, CanvasCoordinates
     , attribution, loadTile
-    , GridPoint, PointerEvent, Value(..), getTags, withViewBounds
+    , GridPoint, MapCoordinates, PointerEvent, ZoomAnimation(..), animateViewTo, cameraDistance, cameraDistanceWithZoomLevel, cameraFov, canvasToWorld_, currentAnimation, fontImageOptions, fragmentShader, getQuadIndices, screenToWorld, vertexShader, viewWith, withViewBounds, worldToLngLat
     )
 
 {-|
@@ -31,7 +31,7 @@ There is a limited amount of styling you can do to the map viewer. Likely you'll
 
 # Panning and zooming
 
-@docs animateZoom, animateZoomAt, animateViewBounds, withPositionAndZoom, viewPosition, viewZoom, viewportHeight, camera, lngLatToWorld, canvasToWorld, canvasSize, DevicePixels, CanvasCoordinates, WorldCoordinates
+@docs animateZoom, animateZoomAt, animateViewBounds, withPositionAndZoom, viewPosition, viewZoom, viewportHeight, camera, lngLatToWorld, canvasToWorld, canvasSize, CanvasCoordinates, WorldCoordinates
 
 
 # Misc
@@ -40,10 +40,8 @@ There is a limited amount of styling you can do to the map viewer. Likely you'll
 
 -}
 
-import Angle
+import Angle exposing (Angle)
 import Array exposing (Array)
-import AssocList as Dict exposing (Dict)
-import Axis2d
 import Axis3d
 import Bitwise
 import BoundingBox2d exposing (BoundingBox2d)
@@ -51,54 +49,51 @@ import Browser.Events
 import Bytes exposing (Bytes)
 import Bytes.Decode as Decode
 import Bytes.Encode
-import Camera3d exposing (Camera3d)
+import Camera3d exposing (Camera3d, Projection(..))
 import Circle2d exposing (Circle2d)
-import Dict as RegularDict
+import CssPixels exposing (CssPixels)
+import DevicePixels exposing (DevicePixels)
+import Dict exposing (Dict)
 import Direction2d exposing (Direction2d)
-import Direction3d
-import Duration
-import Font exposing (Font, Glyph)
+import Duration exposing (Duration)
+import Font2 exposing (Font, Glyph)
+import Geometry.Interop.LinearAlgebra.Point2d as Point2d
+import GridPointDict exposing (GridPointDict)
 import Html exposing (Html)
 import Html.Attributes
 import Html.Events.Extra.Pointer
-import Html.Events.Extra.Touch exposing (Touch)
+import Html.Events.Extra.Touch
 import Html.Events.Extra.Wheel
-import Http
+import Http as Http
 import Int64 exposing (Int64)
-import List.Extra as List
+import List.Extra
 import List.Nonempty exposing (Nonempty(..))
 import LngLat exposing (LngLat)
 import Math.Matrix4 exposing (Mat4)
+import Math.Vector2 exposing (Vec2)
 import Math.Vector3 as Vec3 exposing (Vec3)
 import Math.Vector4 as Vec4 exposing (Vec4)
-import Pixels exposing (Pixels)
+import Plane3d
 import Point2d exposing (Point2d)
 import Point3d
 import Polyline2d
-import Process
+import Process as Process
 import ProtobufDecode exposing (Decoder)
 import Quantity exposing (Quantity(..), Unitless)
 import Random
 import Random.List
 import Rectangle2d exposing (Rectangle2d)
-import Serialize
-import Task
+import Task as Task
 import Time
-import TriangularMesh exposing (TriangularMesh)
 import Url.Builder
 import Vector2d exposing (Vector2d)
-import Viewpoint3d
 import WebGL exposing (Shader)
 import WebGL.Matrices
 import WebGL.Settings
 import WebGL.Settings.Blend
 import WebGL.Settings.StencilTest
+import WebGL.Texture exposing (Texture)
 import ZoomLevel exposing (ZoomLevel)
-
-
-{-| -}
-type DevicePixels
-    = DevicePixel Never
 
 
 {-| -}
@@ -135,12 +130,12 @@ mapboxAccessTokenToString (MapboxAccessToken a) =
 {-| -}
 type Model
     = Model
-        { viewPosition : Point2d Unitless WorldCoordinates
+        { viewPosition : Point2d Unitless MapCoordinates
         , viewZoom : ZoomLevel
         , zoomAnimation : Maybe ZoomAnimation
-        , pointerIsDown : Maybe { dragDistance : Quantity Float Pixels }
-        , touches : RegularDict.Dict Int (Point2d Pixels CanvasCoordinates)
-        , canvasSize : ( Quantity Int Pixels, Quantity Int Pixels )
+        , pointerIsDown : Maybe { dragDistance : Quantity Float CssPixels, maxTouches : Int }
+        , touches : Dict Int (Point2d CssPixels CanvasCoordinates)
+        , canvasSize : ( Quantity Int CssPixels, Quantity Int CssPixels )
         , devicePixelRatio : Float
         , lastAnimationFrame : Maybe Time.Posix
         , tileLoadDebounceCounter : Int
@@ -152,23 +147,24 @@ type Model
 type MapData
     = MapData
         { style : InternalStyle
-        , data : Dict GridPoint TileState
+        , data : GridPointDict TileState
         , font : FontState
         }
 
 
 type FontState
-    = FontNotLoading String
-    | FontLoading
-    | FontLoaded Font
-    | FontLoadFailed Http.Error
+    = FontNotLoading { fntPath : String, imagePath : String }
+    | FontLoading (Maybe Font) (Maybe Texture)
+    | FontLoaded Font Texture
+    | FntLoadFailed Http.Error
+    | TextureLoadFailed WebGL.Texture.Error
 
 
 type ZoomAnimation
-    = ZoomInOrOut { zoomAt : Point2d Unitless WorldCoordinates, zoomLevel : ZoomLevel }
+    = ZoomInOrOut { zoomAt : Point2d Unitless MapCoordinates, zoomLevel : ZoomLevel }
     | PanAndZoom
-        { zoomAtStart : Point2d Unitless WorldCoordinates
-        , zoomAtEnd : Point2d Unitless WorldCoordinates
+        { zoomAtStart : Point2d Unitless MapCoordinates
+        , zoomAtEnd : Point2d Unitless MapCoordinates
         , startTime : Maybe Time.Posix
         , zoomLevelStart : ZoomLevel
         , zoomLevelEnd : ZoomLevel
@@ -196,18 +192,24 @@ type Msg
     | PointerLeave PointerEvent
     | TouchStart
     | TouchMoved
-    | GotFont (Result Http.Error Font)
+    | GotFontData (Result Http.Error Font)
+    | GotFontTexture (Result WebGL.Texture.Error Texture)
 
 
 type alias PointerEvent =
-    { pointerId : Int, position : Point2d Pixels CanvasCoordinates }
+    { pointerId : Int, position : Point2d CssPixels CanvasCoordinates }
 
 
 type alias VisibleTile =
     { zoom : Int, relativeZoom : Float, matrix : Mat4, result : TileState }
 
 
-tileSize : Float -> Vector2d Unitless WorldCoordinates
+currentAnimation : Model -> Maybe ZoomAnimation
+currentAnimation (Model model) =
+    model.zoomAnimation
+
+
+tileSize : Float -> Vector2d Unitless MapCoordinates
 tileSize zoom =
     Vector2d.unitless (1 / 2 ^ zoom) (1 / 2 ^ zoom)
 
@@ -250,7 +252,6 @@ styleToInternal style =
     , ground = colorToVec4 style.ground
     , buildings = colorToVec4 style.buildings
     , nature = colorToVec4 style.nature
-    , background = colorToVec4 style.background
     , primaryRoad = colorToVec3 style.primaryRoad
     , primaryRoadOutline = colorToVec3 style.primaryRoadOutline
     , primaryRoadLink = colorToVec3 style.primaryRoadLink
@@ -298,9 +299,7 @@ styleToInternal style =
     , serviceRoad = colorToVec3 style.serviceRoad
     , serviceRoadOutline = colorToVec3 style.serviceRoadOutline
     , placeLabel = colorToVec3 style.placeLabel
-    , placeLabelOutline = colorToVec3 style.placeLabelOutline
     , roadLabel = colorToVec3 style.roadLabel
-    , roadLabelOutline = colorToVec3 style.roadLabelOutline
     }
 
 
@@ -329,7 +328,6 @@ defaultStyle =
     , ground = rgb 0.87 0.85 0.83
     , buildings = rgb 0.84 0.82 0.8
     , nature = rgb 0.74 0.86 0.68
-    , background = rgb 0.87 0.85 0.83
     , primaryRoad = rgb 0.9 0.9 0.9
     , primaryRoadOutline = rgb 0.84 0.85 0.89
     , primaryRoadLink = rgb 0.9 0.9 0.9
@@ -388,7 +386,6 @@ type alias Style =
     , ground : Color
     , buildings : Color
     , nature : Color
-    , background : Color
     , primaryRoad : Color
     , primaryRoadOutline : Color
     , primaryRoadLink : Color
@@ -446,7 +443,7 @@ init :
     LngLat
     -> ZoomLevel
     -> Float
-    -> ( Quantity Int Pixels, Quantity Int Pixels )
+    -> ( Quantity Int CssPixels, Quantity Int CssPixels )
     -> Model
 init position startingZoom devicePixelRatio canvasSize_ =
     Model
@@ -454,7 +451,7 @@ init position startingZoom devicePixelRatio canvasSize_ =
         , viewZoom = startingZoom
         , zoomAnimation = Nothing
         , pointerIsDown = Nothing
-        , touches = RegularDict.empty
+        , touches = Dict.empty
         , canvasSize = canvasSize_
         , devicePixelRatio = devicePixelRatio
         , lastAnimationFrame = Nothing
@@ -464,12 +461,12 @@ init position startingZoom devicePixelRatio canvasSize_ =
         }
 
 
-initMapData : String -> Style -> MapData
-initMapData fontPath style =
+initMapData : { fntPath : String, imagePath : String } -> Style -> MapData
+initMapData paths style =
     MapData
         { style = styleToInternal style
-        , data = Dict.empty
-        , font = FontNotLoading fontPath
+        , data = GridPointDict.empty
+        , font = FontNotLoading paths
         }
 
 
@@ -501,7 +498,7 @@ animateZoom zoomAmount (Model model) =
 
 {-| Smoothly zoom in by a certain amount while keeping a specific point on the map fixed in place. You can imagine this as zooming in at the point under your cursor.
 -}
-animateZoomAt : Point2d Unitless WorldCoordinates -> Float -> Model -> Model
+animateZoomAt : Point2d Unitless MapCoordinates -> Float -> Model -> Model
 animateZoomAt position zoomAmount (Model model) =
     { model
         | zoomAnimation =
@@ -517,7 +514,7 @@ animateZoomAt position zoomAmount (Model model) =
 
 {-| Set the view position and zoom level without any animation. This will end any ongoing view animation.
 -}
-withPositionAndZoom : Point2d Unitless WorldCoordinates -> ZoomLevel -> Model -> Model
+withPositionAndZoom : Point2d Unitless MapCoordinates -> ZoomLevel -> Model -> Model
 withPositionAndZoom position zoomLevel (Model model) =
     { model
         | viewPosition = position
@@ -530,8 +527,8 @@ withPositionAndZoom position zoomLevel (Model model) =
 
 withViewBounds :
     { left : Int, right : Int, top : Int, bottom : Int }
-    -> LngLat
-    -> LngLat
+    -> Point2d Unitless MapCoordinates
+    -> Point2d Unitless MapCoordinates
     -> Model
     -> Model
 withViewBounds padding point0 point1 (Model model) =
@@ -550,7 +547,12 @@ withViewBounds padding point0 point1 (Model model) =
 
 {-| Smoothly adjust the zoom and view position so that the map fits within the given bounds.
 -}
-animateViewBounds : { left : Int, right : Int, top : Int, bottom : Int } -> LngLat -> LngLat -> Model -> Model
+animateViewBounds :
+    { left : Int, right : Int, top : Int, bottom : Int }
+    -> Point2d Unitless MapCoordinates
+    -> Point2d Unitless MapCoordinates
+    -> Model
+    -> Model
 animateViewBounds padding point0 point1 (Model model) =
     let
         viewBoundsHelper_ =
@@ -571,23 +573,38 @@ animateViewBounds padding point0 point1 (Model model) =
         |> Model
 
 
+{-| Smoothly adjust the zoom and view position so that the map is center at a given position with a given zoom
+-}
+animateViewTo :
+    Point2d Unitless MapCoordinates
+    -> ZoomLevel
+    -> Model
+    -> Model
+animateViewTo point0 zoomLevel (Model model) =
+    { model
+        | zoomAnimation =
+            PanAndZoom
+                { zoomAtStart = model.viewPosition
+                , zoomAtEnd = point0
+                , startTime = Nothing
+                , zoomLevelStart = model.viewZoom
+                , zoomLevelEnd = zoomLevel
+                }
+                |> Just
+        , debouncePending = True
+    }
+        |> Model
+
+
 viewBoundsHelper :
     { left : Int, right : Int, top : Int, bottom : Int }
-    -> LngLat
-    -> LngLat
+    -> Point2d Unitless MapCoordinates
+    -> Point2d Unitless MapCoordinates
     -> Model
-    -> { viewPosition : Point2d Unitless WorldCoordinates, viewZoom : ZoomLevel }
-viewBoundsHelper { left, right, top, bottom } point0 point1 (Model model) =
+    -> { viewPosition : Point2d Unitless MapCoordinates, viewZoom : ZoomLevel }
+viewBoundsHelper { left, right, top, bottom } pointA pointB (Model model) =
     let
-        pointA : Point2d Unitless WorldCoordinates
-        pointA =
-            lngLatToWorld point0
-
-        pointB : Point2d Unitless WorldCoordinates
-        pointB =
-            lngLatToWorld point1
-
-        center : Point2d Unitless WorldCoordinates
+        center : Point2d Unitless MapCoordinates
         center =
             Point2d.centroid pointA [ pointB ]
 
@@ -608,13 +625,13 @@ viewBoundsHelper { left, right, top, bottom } point0 point1 (Model model) =
             size.x / size.y |> abs
 
         paddingWidth =
-            left + right |> Pixels.pixels
+            left + right |> CssPixels.cssPixels
 
         paddingHeight =
-            top + bottom |> Pixels.pixels
+            top + bottom |> CssPixels.cssPixels
 
         zoomLevelEnd =
-            if sizeAspectRatio < aspectRatio then
+            if sizeAspectRatio - aspectRatio < 0 then
                 getViewportZoom
                     model.devicePixelRatio
                     (canvasHeight |> Quantity.minus paddingHeight)
@@ -626,15 +643,15 @@ viewBoundsHelper { left, right, top, bottom } point0 point1 (Model model) =
                     (canvasWidth |> Quantity.minus paddingWidth)
                     (abs size.x)
 
-        centerOffset : Vector2d Unitless WorldCoordinates
+        centerOffset : Vector2d Unitless MapCoordinates
         centerOffset =
             Vector2d.from
-                (screenToWorld_ zoomLevelEnd center (Model model) Point2d.origin)
-                (screenToWorld_
+                (canvasToWorld_ zoomLevelEnd center (Model model) Point2d.origin)
+                (canvasToWorld_
                     zoomLevelEnd
                     center
                     (Model model)
-                    (Point2d.pixels
+                    (CssPixels.point
                         (toFloat (right - left) / 2)
                         (toFloat (bottom - top) / 2)
                     )
@@ -652,7 +669,7 @@ subscriptions (MapData mapData) (Model model) =
     let
         unrenderedTilesExist : Bool
         unrenderedTilesExist =
-            Dict.toList mapData.data
+            GridPointDict.toList mapData.data
                 |> List.any
                     (\( _, tile ) ->
                         case tile of
@@ -700,7 +717,7 @@ tileZoom (Model model) =
     floor (ZoomLevel.toLogZoom model.viewZoom)
 
 
-targetZoomAndPosition : Model -> { zoomLevel : ZoomLevel, viewPosition : Point2d Unitless WorldCoordinates }
+targetZoomAndPosition : Model -> { zoomLevel : ZoomLevel, viewPosition : Point2d Unitless MapCoordinates }
 targetZoomAndPosition (Model model) =
     case model.zoomAnimation of
         Just (ZoomInOrOut zoomInOrOut) ->
@@ -713,7 +730,7 @@ targetZoomAndPosition (Model model) =
             { zoomLevel = model.viewZoom, viewPosition = model.viewPosition }
 
 
-pointToGridMinCorner : Int -> Point2d Unitless WorldCoordinates -> GridPoint
+pointToGridMinCorner : Int -> Point2d Unitless MapCoordinates -> GridPoint
 pointToGridMinCorner zoom point =
     let
         { x, y } =
@@ -725,13 +742,31 @@ pointToGridMinCorner zoom point =
     }
 
 
-{-| Convert a longitude latitude coordinate into a world coordinate.
+{-| Convert longitude and latitude coordinates into Web Mercator coordinates.
 -}
-lngLatToWorld : LngLat -> Point2d Unitless WorldCoordinates
+lngLatToWorld : LngLat -> Point2d Unitless MapCoordinates
 lngLatToWorld lngLat =
     Point2d.unitless
-        ((lngLat.lng + 180) / 360)
-        (0.5 * (1 - (logBase e (tan (lngLat.lat * pi / 180) + 1 / cos (lngLat.lat * pi / 180)) / pi)))
+        (Angle.inTurns lngLat.lng + 0.5)
+        (0.5 * (1 - (logBase e (Angle.tan lngLat.lat + 1 / Angle.cos lngLat.lat) / pi)))
+
+
+{-| Convert Web Mercator coordinates into longitude and latitude coordinates.
+-}
+worldToLngLat : Point2d Unitless MapCoordinates -> LngLat
+worldToLngLat point =
+    let
+        { x, y } =
+            Point2d.toUnitless point
+    in
+    { lng = Angle.turns (x - 0.5)
+    , lat = Angle.radians (atan (sinh (pi - y * 2 * pi)))
+    }
+
+
+sinh : Float -> Float
+sinh x =
+    (e ^ x - e ^ -x) / 2
 
 
 tileCount : Int -> Int
@@ -739,27 +774,58 @@ tileCount zoom =
     2 ^ max 0 zoom
 
 
-visibleRegion_ : Model -> BoundingBox2d Unitless WorldCoordinates
-visibleRegion_ (Model model) =
+visibleRegion : Model -> BoundingBox2d Unitless MapCoordinates
+visibleRegion (Model model) =
+    visibleRegion_ model.viewZoom model.viewPosition (Model model)
+
+
+visibleRegion_ : ZoomLevel -> Point2d Unitless MapCoordinates -> Model -> BoundingBox2d Unitless MapCoordinates
+visibleRegion_ zoom viewPosition_ (Model model) =
     let
+        topLeft : Point2d Unitless MapCoordinates
         topLeft =
-            canvasToWorld (Model model) Point2d.origin
+            canvasToWorld_ zoom viewPosition_ (Model model) Point2d.origin
 
         ( canvasWidth, canvasHeight ) =
             model.canvasSize
 
+        topRight : Point2d Unitless MapCoordinates
+        topRight =
+            canvasToWorld_
+                zoom
+                viewPosition_
+                (Model model)
+                (Point2d.xy
+                    (Quantity.toFloatQuantity canvasWidth)
+                    Quantity.zero
+                )
+
+        bottomLeft : Point2d Unitless MapCoordinates
+        bottomLeft =
+            canvasToWorld_
+                zoom
+                viewPosition_
+                (Model model)
+                (Point2d.xy
+                    Quantity.zero
+                    (Quantity.toFloatQuantity canvasHeight)
+                )
+
+        bottomRight : Point2d Unitless MapCoordinates
         bottomRight =
-            canvasToWorld
+            canvasToWorld_
+                zoom
+                viewPosition_
                 (Model model)
                 (Point2d.xy
                     (Quantity.toFloatQuantity canvasWidth)
                     (Quantity.toFloatQuantity canvasHeight)
                 )
     in
-    BoundingBox2d.from topLeft bottomRight
+    BoundingBox2d.hull topLeft [ topRight, bottomLeft, bottomRight ]
 
 
-gridInsideRegion : BoundingBox2d Unitless WorldCoordinates -> GridPoint -> Bool
+gridInsideRegion : BoundingBox2d Unitless MapCoordinates -> GridPoint -> Bool
 gridInsideRegion region gridPoint =
     BoundingBox2d.intersects
         (BoundingBox2d.from (gridMinCornerToPoint gridPoint) (gridMaxCornerToPoint gridPoint))
@@ -786,24 +852,16 @@ loadMissingTiles accessToken (MapData mapData) (Model model) =
         tileCount_ =
             tileCount zoom - 1
 
+        visibleBounds =
+            visibleRegion_ zoomAndPosition.zoomLevel zoomAndPosition.viewPosition (Model model)
+                |> BoundingBox2d.extrema
+
         topLeft : GridPoint
         topLeft =
-            screenToWorld_ zoomAndPosition.zoomLevel zoomAndPosition.viewPosition (Model model) Point2d.origin
-                |> pointToGridMinCorner zoom
-
-        ( canvasWidth, canvasHeight ) =
-            model.canvasSize
+            pointToGridMinCorner zoom (Point2d.xy visibleBounds.minX visibleBounds.minY)
 
         bottomRight =
-            screenToWorld_
-                zoomAndPosition.zoomLevel
-                zoomAndPosition.viewPosition
-                (Model model)
-                (Point2d.xy
-                    (Quantity.toFloatQuantity canvasWidth)
-                    (Quantity.toFloatQuantity canvasHeight)
-                )
-                |> pointToGridMinCorner zoom
+            pointToGridMinCorner zoom (Point2d.xy visibleBounds.maxX visibleBounds.maxY)
 
         minGridPoint =
             { gridX = min topLeft.gridX bottomRight.gridX |> clamp 0 tileCount_
@@ -828,17 +886,17 @@ loadMissingTiles accessToken (MapData mapData) (Model model) =
             List.range minGridPoint.gridY maxGridPoint.gridY
 
         list =
-            Dict.toList mapData.data
+            GridPointDict.toList mapData.data
 
         ( priorityTiles, newTiles ) =
             List.partition
                 (\( gridPoint, _ ) ->
                     (gridPoint.zoom == 6)
-                        || ((gridPoint.zoom == topLeft.zoom)
-                                && (gridPoint.gridX >= minGridPoint.gridX)
-                                && (gridPoint.gridX <= maxGridPoint.gridX)
-                                && (gridPoint.gridY >= minGridPoint.gridY)
-                                && (gridPoint.gridY <= maxGridPoint.gridY)
+                        || ((gridPoint.zoom - topLeft.zoom == 0)
+                                && (gridPoint.gridX - minGridPoint.gridX >= 0)
+                                && (gridPoint.gridX - maxGridPoint.gridX <= 0)
+                                && (gridPoint.gridY - minGridPoint.gridY >= 0)
+                                && (gridPoint.gridY - maxGridPoint.gridY <= 0)
                            )
                 )
                 list
@@ -852,7 +910,7 @@ loadMissingTiles accessToken (MapData mapData) (Model model) =
                         |> Tuple.first
                         |> Tuple.first
                         |> (++) priorityTiles
-                        |> Dict.fromList
+                        |> GridPointDict.fromList
             }
     in
     xRange
@@ -864,7 +922,7 @@ loadMissingTiles accessToken (MapData mapData) (Model model) =
                             gridPoint =
                                 { gridX = x, gridY = y, zoom = zoom }
                         in
-                        case Dict.get gridPoint model2.data of
+                        case GridPointDict.get gridPoint model2.data of
                             Just _ ->
                                 Nothing
 
@@ -876,7 +934,7 @@ loadMissingTiles accessToken (MapData mapData) (Model model) =
         |> List.sortBy (\{ gridX, gridY } -> abs (toFloat gridX - midpointX) + abs (toFloat gridY - midpointY) |> negate)
         |> List.foldl
             (\gridPoint ( model3, cmd ) ->
-                ( { model3 | data = Dict.insert gridPoint TileLoading model3.data }
+                ( { model3 | data = GridPointDict.insert gridPoint TileLoading model3.data }
                 , Cmd.batch [ cmd, loadTile accessToken (GotData gridPoint) gridPoint ]
                 )
             )
@@ -923,33 +981,52 @@ loadTile accessToken onLoad position =
         }
 
 
-camera_ : Point2d Unitless WorldCoordinates -> Quantity Float Unitless -> Camera3d Unitless WorldCoordinates
+cameraDistance : Model -> Quantity Float Unitless
+cameraDistance (Model model) =
+    cameraDistance_ (viewportHeight model.devicePixelRatio model.canvasSize model.viewZoom)
+
+
+cameraDistanceWithZoomLevel : ZoomLevel -> Model -> Quantity Float Unitless
+cameraDistanceWithZoomLevel zoomLevel (Model model) =
+    cameraDistance_ (viewportHeight model.devicePixelRatio model.canvasSize zoomLevel)
+
+
+cameraDistance_ : Quantity Float Unitless -> Quantity Float Unitless
+cameraDistance_ viewportHeight_ =
+    viewportHeight_ |> Quantity.multiplyBy 1.21
+
+
+camera_ : Point2d Unitless MapCoordinates -> Quantity Float Unitless -> Camera3d Unitless MapCoordinates
 camera_ point viewportHeight_ =
     let
         { x, y } =
             Point2d.toUnitless point
     in
-    Camera3d.orthographic
-        { viewpoint =
-            Viewpoint3d.lookAt
-                { focalPoint = Point3d.fromUnitless { x = x, y = y, z = 0 }
-                , eyePoint = Point3d.fromUnitless { x = x, y = y, z = -1 }
-                , upDirection = Direction3d.negativeY
-                }
-        , viewportHeight = viewportHeight_
+    Camera3d.orbitZ
+        { focalPoint = Point3d.fromUnitless { x = x, y = y, z = 0 }
+        , azimuth = Angle.degrees -90
+        , elevation = Angle.degrees -90
+        , distance = cameraDistance_ viewportHeight_
+        , fov = Camera3d.angle cameraFov
+        , projection = Perspective
         }
+
+
+cameraFov : Angle
+cameraFov =
+    Angle.degrees 45
 
 
 {-| Get the camera that defines what part of the map is being viewed.
 -}
-camera : Model -> Camera3d Unitless WorldCoordinates
+camera : Model -> Camera3d Unitless MapCoordinates
 camera (Model model) =
     camera_ model.viewPosition (viewportHeight model.devicePixelRatio model.canvasSize model.viewZoom)
 
 
 {-| The height of the viewport in world units
 -}
-viewportHeight : Float -> ( Quantity Int Pixels, Quantity Int Pixels ) -> ZoomLevel -> Quantity Float Unitless
+viewportHeight : Float -> ( Quantity Int CssPixels, Quantity Int CssPixels ) -> ZoomLevel -> Quantity Float Unitless
 viewportHeight devicePixelRatio_ ( _, canvasHeight ) zoom =
     let
         tileSize_ =
@@ -959,80 +1036,74 @@ viewportHeight devicePixelRatio_ ( _, canvasHeight ) zoom =
             512 / devicePixelRatio_
 
         canvasHeight_ =
-            Pixels.inPixels canvasHeight |> toFloat
+            CssPixels.inCssPixels canvasHeight |> toFloat
     in
     tileSize_ * canvasHeight_ / tilePixelSize |> Quantity.float
 
 
 {-| Get how zoomed in the camera is.
 -}
-getViewportZoom : Float -> Quantity Int Pixels -> Float -> ZoomLevel
+getViewportZoom : Float -> Quantity Int CssPixels -> Float -> ZoomLevel
 getViewportZoom devicePixelRatio_ canvasLength viewportHeight_ =
     let
         tilePixelSize =
             512 / devicePixelRatio_
 
         canvasHeight =
-            Pixels.inPixels canvasLength |> toFloat
+            CssPixels.inCssPixels canvasLength |> toFloat
     in
     canvasHeight / (tilePixelSize * viewportHeight_) |> ZoomLevel.fromLinearZoom
 
 
-screenToWorld_ : ZoomLevel -> Point2d Unitless WorldCoordinates -> Model -> Point2d Pixels CanvasCoordinates -> Point2d Unitless WorldCoordinates
-screenToWorld_ zoom viewPosition_ (Model model) screenPosition =
+screenToWorld : Model -> Point2d CssPixels CanvasCoordinates -> Point2d Unitless MapCoordinates
+screenToWorld (Model model) screenPosition =
+    canvasToWorld_ model.viewZoom model.viewPosition (Model model) screenPosition
+
+
+canvasToWorld_ : ZoomLevel -> Point2d Unitless MapCoordinates -> Model -> Point2d CssPixels CanvasCoordinates -> Point2d Unitless MapCoordinates
+canvasToWorld_ zoom viewPosition_ (Model model) screenPosition =
     let
-        camera2 : Camera3d Unitless WorldCoordinates
+        camera2 : Camera3d Unitless MapCoordinates
         camera2 =
             camera_ viewPosition_ (viewportHeight model.devicePixelRatio model.canvasSize zoom)
 
         ( canvasWidth, canvasHeight ) =
             model.canvasSize
 
-        screenRectangle : Rectangle2d Pixels CanvasCoordinates
+        screenRectangle : Rectangle2d CssPixels CanvasCoordinates
         screenRectangle =
             Rectangle2d.from
                 (Point2d.xy Quantity.zero (Quantity.toFloatQuantity canvasHeight))
                 (Point2d.xy (Quantity.toFloatQuantity canvasWidth) Quantity.zero)
     in
     Camera3d.ray camera2 screenRectangle screenPosition
-        |> Axis3d.originPoint
+        |> Axis3d.intersectionWithPlane Plane3d.xy
+        |> Maybe.withDefault Point3d.origin
         |> (\p -> Point3d.toUnitless p |> (\a -> Point2d.unitless a.x a.y))
 
 
 {-| Convert a canvas position to a world position.
 -}
-canvasToWorld : Model -> Point2d Pixels CanvasCoordinates -> Point2d Unitless WorldCoordinates
+canvasToWorld : Model -> Point2d CssPixels CanvasCoordinates -> Point2d Unitless MapCoordinates
 canvasToWorld (Model model) screenPosition =
-    let
-        ( canvasWidth, canvasHeight ) =
-            model.canvasSize
-
-        screenRectangle : Rectangle2d Pixels CanvasCoordinates
-        screenRectangle =
-            Rectangle2d.from
-                (Point2d.xy Quantity.zero (Quantity.toFloatQuantity canvasHeight))
-                (Point2d.xy (Quantity.toFloatQuantity canvasWidth) Quantity.zero)
-    in
-    Camera3d.ray (camera (Model model)) screenRectangle screenPosition
-        |> Axis3d.originPoint
-        |> (\p -> Point3d.toUnitless p |> (\a -> Point2d.unitless a.x a.y))
+    canvasToWorld_ model.viewZoom model.viewPosition (Model model) screenPosition
 
 
 type OutMsg
     = PointerPressed
-        { canvasPosition : Point2d Pixels CanvasCoordinates
-        , worldPosition : Point2d Unitless WorldCoordinates
+        { canvasPosition : Point2d CssPixels CanvasCoordinates
+        , worldPosition : Point2d Unitless MapCoordinates
         }
     | PointerReleased
-        { canvasPosition : Point2d Pixels CanvasCoordinates
-        , worldPosition : Point2d Unitless WorldCoordinates
-        , dragDistance : Quantity Float Pixels
+        { canvasPosition : Point2d CssPixels CanvasCoordinates
+        , worldPosition : Point2d Unitless MapCoordinates
+        , dragDistance : Quantity Float CssPixels
         }
 
 
 {-| Position of the camera center point.
 -}
-viewPosition : Model -> Point2d Unitless WorldCoordinates
+viewPosition : Model -> Point2d Unitless MapCoordinates
 viewPosition (Model model) =
     model.viewPosition
 
@@ -1064,7 +1135,7 @@ update accessToken (MapData mapData) msg (Model model) =
             , newMapData =
                 { mapData
                     | data =
-                        Dict.insert
+                        GridPointDict.insert
                             position
                             (case result of
                                 Ok bytes ->
@@ -1080,18 +1151,54 @@ update accessToken (MapData mapData) msg (Model model) =
             , cmd = Cmd.none
             }
 
-        GotFont result ->
+        GotFontData result ->
             case result of
                 Ok font ->
                     { newModel = Model model
-                    , newMapData = MapData { mapData | font = FontLoaded font }
+                    , newMapData =
+                        MapData
+                            { mapData
+                                | font =
+                                    case mapData.font of
+                                        FontLoading _ (Just texture) ->
+                                            FontLoaded font texture
+
+                                        _ ->
+                                            FontLoading (Just font) Nothing
+                            }
                     , outMsg = Nothing
                     , cmd = Cmd.none
                     }
 
                 Err error ->
                     { newModel = Model model
-                    , newMapData = MapData { mapData | font = FontLoadFailed error }
+                    , newMapData = MapData { mapData | font = FntLoadFailed error }
+                    , outMsg = Nothing
+                    , cmd = Cmd.none
+                    }
+
+        GotFontTexture result ->
+            case result of
+                Ok texture ->
+                    { newModel = Model model
+                    , newMapData =
+                        MapData
+                            { mapData
+                                | font =
+                                    case mapData.font of
+                                        FontLoading (Just font) _ ->
+                                            FontLoaded font texture
+
+                                        _ ->
+                                            FontLoading Nothing (Just texture)
+                            }
+                    , outMsg = Nothing
+                    , cmd = Cmd.none
+                    }
+
+                Err error ->
+                    { newModel = Model model
+                    , newMapData = MapData { mapData | font = TextureLoadFailed error }
                     , outMsg = Nothing
                     , cmd = Cmd.none
                     }
@@ -1099,9 +1206,9 @@ update accessToken (MapData mapData) msg (Model model) =
         PointerDown event ->
             { newModel =
                 { model
-                    | pointerIsDown = Just { dragDistance = Quantity.zero }
+                    | pointerIsDown = Just { dragDistance = Quantity.zero, maxTouches = Dict.size model.touches + 1 }
                     , touches =
-                        RegularDict.insert event.pointerId event.position model.touches
+                        Dict.insert event.pointerId event.position model.touches
                 }
                     |> Model
             , newMapData = MapData mapData
@@ -1117,20 +1224,24 @@ update accessToken (MapData mapData) msg (Model model) =
         PointerUp event ->
             let
                 model2 =
-                    { model | touches = RegularDict.remove event.pointerId model.touches }
+                    { model | touches = Dict.remove event.pointerId model.touches }
             in
-            if RegularDict.isEmpty model2.touches then
+            if Dict.isEmpty model2.touches then
                 { newModel = Model { model2 | pointerIsDown = Nothing }
                 , newMapData = MapData mapData
                 , outMsg =
                     case model2.pointerIsDown of
                         Just mouseDown ->
-                            PointerReleased
-                                { canvasPosition = event.position
-                                , worldPosition = canvasToWorld (Model model) event.position
-                                , dragDistance = mouseDown.dragDistance
-                                }
-                                |> Just
+                            if mouseDown.maxTouches > 1 then
+                                Nothing
+
+                            else
+                                PointerReleased
+                                    { canvasPosition = event.position
+                                    , worldPosition = canvasToWorld (Model model) event.position
+                                    , dragDistance = mouseDown.dragDistance
+                                    }
+                                    |> Just
 
                         Nothing ->
                             Nothing
@@ -1147,10 +1258,10 @@ update accessToken (MapData mapData) msg (Model model) =
         PointerLeave event ->
             let
                 model2 =
-                    { model | touches = RegularDict.remove event.pointerId model.touches }
+                    { model | touches = Dict.remove event.pointerId model.touches }
             in
             { newModel =
-                if RegularDict.isEmpty model2.touches then
+                if Dict.isEmpty model2.touches then
                     Model { model2 | pointerIsDown = Nothing }
 
                 else
@@ -1163,7 +1274,7 @@ update accessToken (MapData mapData) msg (Model model) =
         MouseWheelMoved event ->
             if abs event.deltaY < 20 then
                 let
-                    mousePosition : Point2d Pixels CanvasCoordinates
+                    mousePosition : Point2d CssPixels CanvasCoordinates
                     mousePosition =
                         clientPosToScreen event.mouseEvent
 
@@ -1196,7 +1307,7 @@ update accessToken (MapData mapData) msg (Model model) =
                         else
                             2
 
-                    mousePosition : Point2d Pixels CanvasCoordinates
+                    mousePosition : Point2d CssPixels CanvasCoordinates
                     mousePosition =
                         clientPosToScreen event.mouseEvent
 
@@ -1228,9 +1339,9 @@ update accessToken (MapData mapData) msg (Model model) =
                             zoomSpeed =
                                 1.1
                         in
-                        if zoom * zoomSpeed > targetZoom && zoom / zoomSpeed < targetZoom then
+                        if (zoom * zoomSpeed) - targetZoom > 0 && (zoom / zoomSpeed) - targetZoom < 0 then
                             let
-                                newPositionAndZoom : { position : Point2d Unitless WorldCoordinates, zoom : ZoomLevel }
+                                newPositionAndZoom : { position : Point2d Unitless MapCoordinates, zoom : ZoomLevel }
                                 newPositionAndZoom =
                                     zoomAt zoomInOrOut.zoomAt (targetZoom / zoom) (Model model)
                             in
@@ -1244,11 +1355,11 @@ update accessToken (MapData mapData) msg (Model model) =
 
                         else
                             let
-                                newPositionAndZoom : { position : Point2d Unitless WorldCoordinates, zoom : ZoomLevel }
+                                newPositionAndZoom : { position : Point2d Unitless MapCoordinates, zoom : ZoomLevel }
                                 newPositionAndZoom =
                                     zoomAt
                                         zoomInOrOut.zoomAt
-                                        (if zoom < targetZoom then
+                                        (if zoom - targetZoom < 0 then
                                             zoomSpeed
 
                                          else
@@ -1267,6 +1378,7 @@ update accessToken (MapData mapData) msg (Model model) =
                         case panAndZoom.startTime of
                             Just startTime ->
                                 let
+                                    zoomDuration : Duration
                                     zoomDuration =
                                         ZoomLevel.toLogZoom panAndZoom.zoomLevelStart
                                             - ZoomLevel.toLogZoom panAndZoom.zoomLevelEnd
@@ -1276,6 +1388,7 @@ update accessToken (MapData mapData) msg (Model model) =
                                             |> max 0.5
                                             |> Duration.seconds
 
+                                    panDuration : Duration
                                     panDuration =
                                         Point2d.distanceFrom panAndZoom.zoomAtStart panAndZoom.zoomAtEnd
                                             |> Quantity.toFloat
@@ -1284,23 +1397,29 @@ update accessToken (MapData mapData) msg (Model model) =
                                             |> max 0.5
                                             |> Duration.seconds
 
+                                    duration : Quantity Float Duration.Seconds
                                     duration =
-                                        Quantity.max zoomDuration panDuration
+                                        Quantity.max zoomDuration panDuration |> Quantity.multiplyBy 0.5
 
+                                    t : Float
                                     t =
                                         Quantity.ratio (Duration.from startTime time) duration
                                             |> clamp 0 1
 
+                                    newZoomLevel : ZoomLevel
                                     newZoomLevel =
                                         ((ZoomLevel.toLogZoom panAndZoom.zoomLevelEnd - startZoom) * t + startZoom)
                                             |> ZoomLevel.fromLogZoom
 
+                                    startZoom : Float
                                     startZoom =
                                         ZoomLevel.toLogZoom panAndZoom.zoomLevelStart
 
+                                    endZoom : Float
                                     endZoom =
                                         ZoomLevel.toLogZoom panAndZoom.zoomLevelEnd
 
+                                    t2 : Float
                                     t2 =
                                         1 - (2 ^ ((startZoom - endZoom) * t)) * (1 - t)
                                 in
@@ -1351,7 +1470,7 @@ update accessToken (MapData mapData) msg (Model model) =
                         | font =
                             case mapData2.font of
                                 FontNotLoading _ ->
-                                    FontLoading
+                                    FontLoading Nothing Nothing
 
                                 _ ->
                                     mapData2.font
@@ -1360,14 +1479,17 @@ update accessToken (MapData mapData) msg (Model model) =
                 fontCmd : Cmd Msg
                 fontCmd =
                     case mapData2.font of
-                        FontNotLoading fontPath ->
-                            Http.get
-                                { url = fontPath
-                                , expect =
-                                    Http.expectJson
-                                        GotFont
-                                        (Serialize.getJsonDecoder identity Font.codec)
-                                }
+                        FontNotLoading { fntPath, imagePath } ->
+                            Cmd.batch
+                                [ Http.get
+                                    { url = fntPath
+                                    , expect = Http.expectBytes GotFontData Font2.decode
+                                    }
+                                , WebGL.Texture.loadWith
+                                    fontImageOptions
+                                    imagePath
+                                    |> Task.attempt GotFontTexture
+                                ]
 
                         _ ->
                             Cmd.none
@@ -1376,7 +1498,7 @@ update accessToken (MapData mapData) msg (Model model) =
                     Cmd.batch [ cmd, cmd2, fontCmd ]
             in
             case
-                Dict.toList mapData3.data
+                GridPointDict.toList mapData3.data
                     |> List.filterMap
                         (\( coord, tile ) ->
                             case tile of
@@ -1398,14 +1520,14 @@ update accessToken (MapData mapData) msg (Model model) =
                                     TileError
                     in
                     { newModel = Model model3
-                    , newMapData = MapData { mapData3 | data = Dict.insert coord a mapData3.data }
+                    , newMapData = MapData { mapData3 | data = GridPointDict.insert coord a mapData3.data }
                     , outMsg = Nothing
                     , cmd = cmds
                     }
 
                 [] ->
                     case mapData.font of
-                        FontLoaded font ->
+                        FontLoaded font _ ->
                             { newModel = Model model3
                             , newMapData = handleNextTileToTileText model3.devicePixelRatio font (MapData mapData3)
                             , outMsg = Nothing
@@ -1427,17 +1549,17 @@ update accessToken (MapData mapData) msg (Model model) =
                 model2 =
                     { model
                         | touches =
-                            RegularDict.update
+                            Dict.update
                                 event.pointerId
                                 (Maybe.map (\_ -> event.position))
                                 model.touches
                     }
 
                 ( model3, cmd ) =
-                    case ( RegularDict.values model2.touches, RegularDict.values model.touches ) of
+                    case ( Dict.values model2.touches, Dict.values model.touches ) of
                         ( [ single ], [ oldSingle ] ) ->
                             let
-                                newPosition : Point2d Unitless WorldCoordinates
+                                newPosition : Point2d Unitless MapCoordinates
                                 newPosition =
                                     let
                                         v =
@@ -1475,20 +1597,20 @@ update accessToken (MapData mapData) msg (Model model) =
 
                         ( [ first, second ], [ oldFirst, oldSecond ] ) ->
                             let
-                                newDistance : Quantity Float Pixels
+                                newDistance : Quantity Float CssPixels
                                 newDistance =
-                                    Point2d.distanceFrom first second |> Quantity.max Pixels.pixel
+                                    Point2d.distanceFrom first second |> Quantity.max CssPixels.cssPixel
 
-                                oldDistance : Quantity Float Pixels
+                                oldDistance : Quantity Float CssPixels
                                 oldDistance =
-                                    Point2d.distanceFrom oldFirst oldSecond |> Quantity.max Pixels.pixel
+                                    Point2d.distanceFrom oldFirst oldSecond |> Quantity.max CssPixels.cssPixel
 
-                                newCenter : Point2d Unitless WorldCoordinates
+                                newCenter : Point2d Unitless MapCoordinates
                                 newCenter =
                                     Point2d.centroid first [ second ]
                                         |> canvasToWorld (Model model)
 
-                                oldCenter : Point2d Pixels CanvasCoordinates
+                                oldCenter : Point2d CssPixels CanvasCoordinates
                                 oldCenter =
                                     Point2d.centroid oldFirst [ oldSecond ]
 
@@ -1496,7 +1618,7 @@ update accessToken (MapData mapData) msg (Model model) =
                                 scaleChange =
                                     Quantity.ratio newDistance oldDistance
 
-                                newPosition : Point2d Unitless WorldCoordinates
+                                newPosition : Point2d Unitless MapCoordinates
                                 newPosition =
                                     let
                                         v =
@@ -1523,7 +1645,7 @@ update accessToken (MapData mapData) msg (Model model) =
             { newModel = model3, newMapData = MapData mapData, outMsg = Nothing, cmd = cmd }
 
         DebounceFinished counter ->
-            if counter == model.tileLoadDebounceCounter then
+            if counter - model.tileLoadDebounceCounter == 0 then
                 let
                     ( mapData2, cmd ) =
                         loadMissingTiles accessToken (MapData mapData) (Model model)
@@ -1537,10 +1659,20 @@ update accessToken (MapData mapData) msg (Model model) =
             { newModel = Model model, newMapData = MapData mapData, outMsg = Nothing, cmd = Cmd.none }
 
 
+fontImageOptions : WebGL.Texture.Options
+fontImageOptions =
+    { magnify = WebGL.Texture.nearest
+    , minify = WebGL.Texture.linearMipmapNearest
+    , horizontalWrap = WebGL.Texture.clampToEdge
+    , verticalWrap = WebGL.Texture.clampToEdge
+    , flipY = True
+    }
+
+
 handleNextTileToTileText : Float -> Font -> MapData -> MapData
 handleNextTileToTileText devicePixelRatio font (MapData mapData) =
     case
-        Dict.toList mapData.data
+        GridPointDict.toList mapData.data
             |> List.filterMap
                 (\( coord, tile ) ->
                     case tile of
@@ -1554,15 +1686,15 @@ handleNextTileToTileText devicePixelRatio font (MapData mapData) =
         ( coord, tile ) :: _ ->
             let
                 neighbors :
-                    { roadLabelChars : List (Point2d Unitless WorldCoordinates)
-                    , placeLabelChars : List (Circle2d Unitless WorldCoordinates)
+                    { roadLabelChars : List (Point2d Unitless MapCoordinates)
+                    , placeLabelChars : List (Circle2d Unitless MapCoordinates)
                     }
                 neighbors =
                     [ ( -1, -1 ), ( -1, 0 ), ( -1, 1 ), ( 1, -1 ), ( 1, 0 ), ( 1, 1 ), ( 0, 1 ), ( 0, -1 ) ]
                         |> List.filterMap
                             (\( x, y ) ->
                                 case
-                                    Dict.get
+                                    GridPointDict.get
                                         { gridX = coord.gridX + x, gridY = coord.gridY + y, zoom = coord.zoom }
                                         mapData.data
                                 of
@@ -1582,7 +1714,7 @@ handleNextTileToTileText devicePixelRatio font (MapData mapData) =
             in
             { mapData
                 | data =
-                    Dict.insert
+                    GridPointDict.insert
                         coord
                         (tileToTileWithText mapData.style devicePixelRatio font neighbors coord tile
                             |> TileLoadedWithText
@@ -1595,12 +1727,12 @@ handleNextTileToTileText devicePixelRatio font (MapData mapData) =
             MapData mapData
 
 
-clientPosToScreen : { a | offsetPos : ( Float, Float ) } -> Point2d Pixels CanvasCoordinates
+clientPosToScreen : { a | offsetPos : ( Float, Float ) } -> Point2d CssPixels CanvasCoordinates
 clientPosToScreen { offsetPos } =
-    Point2d.fromTuple Pixels.pixels offsetPos
+    Point2d.fromTuple CssPixels.cssPixels offsetPos
 
 
-clampViewPosition : Point2d Unitless WorldCoordinates -> Point2d Unitless WorldCoordinates
+clampViewPosition : Point2d Unitless MapCoordinates -> Point2d Unitless MapCoordinates
 clampViewPosition p =
     Point2d.toUnitless p
         |> (\{ x, y } ->
@@ -1609,7 +1741,7 @@ clampViewPosition p =
            )
 
 
-zoomAt : Point2d Unitless WorldCoordinates -> Float -> Model -> { position : Point2d Unitless WorldCoordinates, zoom : ZoomLevel }
+zoomAt : Point2d Unitless MapCoordinates -> Float -> Model -> { position : Point2d Unitless MapCoordinates, zoom : ZoomLevel }
 zoomAt zoomPoint zoomDelta (Model model) =
     let
         ( canvasWidth, canvasHeight ) =
@@ -1636,7 +1768,7 @@ zoomAt zoomPoint zoomDelta (Model model) =
 -}
 resizeCanvas :
     Float
-    -> ( Quantity Int Pixels, Quantity Int Pixels )
+    -> ( Quantity Int CssPixels, Quantity Int CssPixels )
     -> Model
     -> Model
 resizeCanvas devicePixelRatio_ canvasSize_ (Model model) =
@@ -1645,13 +1777,13 @@ resizeCanvas devicePixelRatio_ canvasSize_ (Model model) =
 
 {-| Returns the size of the canvas in css pixels and in device pixels. If your device pixel ratio is 1 then these values are the same. If the device pixel ratio is 2 then the device pixel canvas size will be twice as large as the css pixel canvas size.
 
-Important to note: the css pixel canvas size might not exactly match the canvas size you specified in `init` or `resizeCanvas`. This is because the canvas size needs to adjusted so that devicePixelRatio \* cssPixelCanvasSize gives integer values for devicePixelCanvasSize. If we didn't do this, the rendered canvas would be slightly blurry.
+Important to note: the css pixel canvas size might not exactly match the canvas size you specified in `init` or `resizeCanvas`. This is because the canvas size needs to adjusted so that devicePixelRatio \* CssPixel.cssPixelCanvasSize gives integer values for devicePixelCanvasSize. If we didn't do this, the rendered canvas would be slightly blurry.
 
 -}
 canvasSize :
     Model
     ->
-        { canvasSize : ( Quantity Int Pixels, Quantity Int Pixels )
+        { canvasSize : ( Quantity Int CssPixels, Quantity Int CssPixels )
         , devicePixelCanvasSize : ( Quantity Int DevicePixels, Quantity Int DevicePixels )
         }
 canvasSize (Model model) =
@@ -1659,20 +1791,20 @@ canvasSize (Model model) =
         ( canvasWidth, canvasHeight ) =
             model.canvasSize
 
-        findValue : Quantity Int Pixels -> ( Int, Int )
+        findValue : Quantity Int CssPixels -> ( Int, Int )
         findValue value =
             List.range 0 9
-                |> List.map ((+) (Pixels.inPixels value))
-                |> List.find
+                |> List.map ((+) (CssPixels.inCssPixels value))
+                |> List.Extra.find
                     (\v ->
                         let
                             a =
                                 toFloat v * model.devicePixelRatio
                         in
-                        a == toFloat (round a) && modBy 2 (round a) == 0
+                        a - toFloat (round a) == 0 && modBy 2 (round a) == 0
                     )
                 |> Maybe.map (\v -> ( v, toFloat v * model.devicePixelRatio |> round ))
-                |> Maybe.withDefault ( Pixels.inPixels value, toFloat (Pixels.inPixels value) * model.devicePixelRatio |> round )
+                |> Maybe.withDefault ( CssPixels.inCssPixels value, toFloat (CssPixels.inCssPixels value) * model.devicePixelRatio |> round )
 
         ( w, actualW ) =
             findValue canvasWidth
@@ -1680,15 +1812,37 @@ canvasSize (Model model) =
         ( h, actualH ) =
             findValue canvasHeight
     in
-    { canvasSize = ( Pixels.pixels w, Pixels.pixels h )
-    , devicePixelCanvasSize = ( Quantity actualW, Quantity actualH )
+    { canvasSize = ( CssPixels.cssPixels w, CssPixels.cssPixels h )
+    , devicePixelCanvasSize = ( DevicePixels.devicePixels actualW, DevicePixels.devicePixels actualH )
     }
 
 
 {-| Draw the map! You can add additional layers on top of the map as well though for now this isn't easy to do unless you are well versed in how to use `elm-explorations/webgl`. The plan is to add helper functions in a future version of this package that make it easier.
 -}
-view : List WebGL.Entity -> MapData -> Model -> Html Msg
-view extraLayers (MapData mapData) (Model model) =
+view : (Msg -> msg) -> MapData -> Model -> Html msg
+view onMapMsg mapData model =
+    viewWith
+        { inputsEnabled = True
+        , overrideCamera = Nothing
+        , attributes = []
+        , fillColor = rgb 0.87 0.85 0.83
+        }
+        []
+        onMapMsg
+        mapData
+        model
+
+
+type alias Config msg =
+    { inputsEnabled : Bool
+    , overrideCamera : Maybe (Camera3d Unitless MapCoordinates)
+    , attributes : List (Html.Attribute msg)
+    , fillColor : Color
+    }
+
+
+viewWith : Config msg -> List WebGL.Entity -> (Msg -> msg) -> MapData -> Model -> Html msg
+viewWith config extraLayers onMapMsg (MapData mapData) (Model model) =
     let
         ( cssWindowWidth, cssWindowHeight ) =
             perfectSize.canvasSize
@@ -1704,12 +1858,26 @@ view extraLayers (MapData mapData) (Model model) =
                 (Quantity.toFloatQuantity canvasWidth)
                 (Quantity.toFloatQuantity canvasHeight)
 
+        viewportHeight2 =
+            viewportHeight model.devicePixelRatio model.canvasSize model.viewZoom
+
+        actualCamera : Camera3d Unitless MapCoordinates
+        actualCamera =
+            case config.overrideCamera of
+                Just camera2 ->
+                    camera2
+
+                Nothing ->
+                    camera_
+                        model.viewPosition
+                        viewportHeight2
+
         viewMatrix : Mat4
         viewMatrix =
             WebGL.Matrices.viewProjectionMatrix
-                (camera (Model model))
-                { nearClipDepth = Quantity.float 0.1
-                , farClipDepth = Quantity.float 10
+                actualCamera
+                { nearClipDepth = Quantity.float (0.001 / ZoomLevel.toLinearZoom model.viewZoom)
+                , farClipDepth = Quantity.float (1000 / ZoomLevel.toLinearZoom model.viewZoom)
                 , aspectRatio = aspectRatio
                 }
 
@@ -1720,10 +1888,11 @@ view extraLayers (MapData mapData) (Model model) =
         normalZoom : Float
         normalZoom =
             ZoomLevel.toLinearZoom model.viewZoom
+                * (Quantity.ratio (cameraDistance_ viewportHeight2) (Camera3d.focalDistance actualCamera) ^ 0.8)
 
-        visibleBounds : BoundingBox2d Unitless WorldCoordinates
+        visibleBounds : BoundingBox2d Unitless MapCoordinates
         visibleBounds =
-            visibleRegion_ (Model model)
+            visibleRegion (Model model)
 
         drawRoad : Bool -> { a | roadLayer : WebGL.Mesh RoadVertex } -> Float -> Mat4 -> WebGL.Entity
         drawRoad isOutline tile relativeZoom matrix =
@@ -1750,7 +1919,7 @@ view extraLayers (MapData mapData) (Model model) =
 
         visibleTiles : List (List VisibleTile)
         visibleTiles =
-            Dict.toList mapData.data
+            GridPointDict.toList mapData.data
                 |> List.filterMap
                     (\( position, result ) ->
                         let
@@ -1763,7 +1932,7 @@ view extraLayers (MapData mapData) (Model model) =
                             isVisible =
                                 List.any
                                     (\childPosition ->
-                                        gridInsideRegion visibleBounds childPosition && not (Dict.member childPosition mapData.data)
+                                        gridInsideRegion visibleBounds childPosition && not (GridPointDict.member childPosition mapData.data)
                                     )
                                     [ { zoom = position.zoom + 1, gridX = gridX2, gridY = gridY2 + 1 }
                                     , { zoom = position.zoom + 1, gridX = gridX2 + 1, gridY = gridY2 + 1 }
@@ -1772,8 +1941,8 @@ view extraLayers (MapData mapData) (Model model) =
                                     ]
                         in
                         if
-                            (position.zoom == zoom && gridInsideRegion visibleBounds position)
-                                || (position.zoom < zoom && isVisible)
+                            (position.zoom - zoom == 0 && gridInsideRegion visibleBounds position)
+                                || (position.zoom - zoom < 0 && isVisible)
                         then
                             let
                                 modelMatrix =
@@ -1800,7 +1969,7 @@ view extraLayers (MapData mapData) (Model model) =
                         else
                             Nothing
                     )
-                |> List.gatherEqualsBy .zoom
+                |> List.Extra.gatherEqualsBy .zoom
                 |> List.sortBy (Tuple.first >> .zoom)
                 |> List.map (\( head, rest ) -> head :: rest)
 
@@ -1939,16 +2108,22 @@ view extraLayers (MapData mapData) (Model model) =
                             Nothing
 
                         TileLoadedWithText tile ->
-                            WebGL.entityWith
-                                [ WebGL.Settings.cullFace WebGL.Settings.back ]
-                                labelVertexShader
-                                roadFragmentShader
-                                tile.roadLabelLayer
-                                { color = Vec4.vec4 0.7 0.7 0.7 1
-                                , matrix = matrix
-                                , offsetScale = model.devicePixelRatio / relativeZoom
-                                }
-                                |> Just
+                            case mapData.font of
+                                FontLoaded _ texture ->
+                                    WebGL.entityWith
+                                        [ blend ]
+                                        labelVertexShader
+                                        labelFragmentShader
+                                        tile.roadLabelLayer
+                                        { color = Vec4.vec4 0.7 0.7 0.7 1
+                                        , matrix = matrix
+                                        , offsetScale = model.devicePixelRatio / relativeZoom
+                                        , fontTexture = texture
+                                        }
+                                        |> Just
+
+                                _ ->
+                                    Nothing
 
                         TileError ->
                             Nothing
@@ -1970,16 +2145,22 @@ view extraLayers (MapData mapData) (Model model) =
                             Nothing
 
                         TileLoadedWithText tile ->
-                            WebGL.entityWith
-                                [ WebGL.Settings.cullFace WebGL.Settings.back ]
-                                labelVertexShader
-                                roadFragmentShader
-                                tile.placeLabelLayer
-                                { color = Vec4.vec4 0.7 0.7 0.7 1
-                                , matrix = matrix
-                                , offsetScale = model.devicePixelRatio / relativeZoom
-                                }
-                                |> Just
+                            case mapData.font of
+                                FontLoaded _ texture ->
+                                    WebGL.entityWith
+                                        [ blend ]
+                                        labelVertexShader
+                                        labelFragmentShader
+                                        tile.placeLabelLayer
+                                        { color = Vec4.vec4 0.7 0.7 0.7 1
+                                        , matrix = matrix
+                                        , offsetScale = model.devicePixelRatio / relativeZoom
+                                        , fontTexture = texture
+                                        }
+                                        |> Just
+
+                                _ ->
+                                    Nothing
 
                         TileError ->
                             Nothing
@@ -1993,47 +2174,73 @@ view extraLayers (MapData mapData) (Model model) =
                 tiles
     in
     WebGL.toHtmlWith
-        [ WebGL.stencil 0
-        , WebGL.clearColor
-            (Vec4.getX mapData.style.background)
-            (Vec4.getY mapData.style.background)
-            (Vec4.getZ mapData.style.background)
-            (Vec4.getW mapData.style.background)
-        , WebGL.antialias
-        ]
-        ([ Html.Attributes.width (Quantity.unwrap (Tuple.first perfectSize.devicePixelCanvasSize))
-         , Html.Attributes.height (Quantity.unwrap (Tuple.second perfectSize.devicePixelCanvasSize))
-         , Html.Attributes.style "width" (String.fromInt (Pixels.inPixels cssWindowWidth) ++ "px")
-         , Html.Attributes.style "height" (String.fromInt (Pixels.inPixels cssWindowHeight) ++ "px")
-         , Html.Events.Extra.Wheel.onWheel MouseWheelMoved
-         , Html.Events.Extra.Touch.onStart (\_ -> TouchStart)
-         , Html.Events.Extra.Touch.onMove (\_ -> TouchMoved)
-         , Html.Events.Extra.Pointer.onDown (eventToPointerEvent PointerDown)
-         , Html.Events.Extra.Pointer.onUp (eventToPointerEvent PointerUp)
-         , Html.Events.Extra.Pointer.onLeave (eventToPointerEvent PointerLeave)
+        ([ WebGL.stencil 0
+         , WebGL.clearColor config.fillColor.red config.fillColor.green config.fillColor.blue 1
+         , WebGL.depth 1
          ]
-            ++ (case model.pointerIsDown of
-                    Just _ ->
-                        [ Html.Events.Extra.Pointer.onMove (eventToPointerEvent PointerMoved) ]
+            ++ (if model.devicePixelRatio >= 2 then
+                    []
 
-                    Nothing ->
-                        []
+                else
+                    [ WebGL.antialias ]
                )
         )
-        (List.concatMap
-            (\tiles ->
-                background tiles
-                    ++ nature tiles
-                    ++ contour tiles
-                    ++ buildings tiles
-                    ++ roads True tiles
-                    ++ roads False tiles
-                    ++ roadLabels tiles
-                    ++ placeLabels tiles
-            )
-            visibleTiles
+        ([ Html.Attributes.width (Quantity.unwrap (Tuple.first perfectSize.devicePixelCanvasSize))
+         , Html.Attributes.height (Quantity.unwrap (Tuple.second perfectSize.devicePixelCanvasSize))
+         , Html.Attributes.style "width" (String.fromInt (CssPixels.inCssPixels cssWindowWidth) ++ "px")
+         , Html.Attributes.style "height" (String.fromInt (CssPixels.inCssPixels cssWindowHeight) ++ "px")
+         ]
+            ++ (if config.inputsEnabled then
+                    [ Html.Events.Extra.Wheel.onWheel MouseWheelMoved |> Html.Attributes.map onMapMsg
+                    , Html.Events.Extra.Touch.onStart (\_ -> TouchStart) |> Html.Attributes.map onMapMsg
+                    , Html.Events.Extra.Touch.onMove (\_ -> TouchMoved) |> Html.Attributes.map onMapMsg
+                    , Html.Events.Extra.Pointer.onDown (eventToPointerEvent PointerDown) |> Html.Attributes.map onMapMsg
+                    , Html.Events.Extra.Pointer.onUp (eventToPointerEvent PointerUp) |> Html.Attributes.map onMapMsg
+                    , Html.Events.Extra.Pointer.onCancel (eventToPointerEvent PointerUp) |> Html.Attributes.map onMapMsg
+                    , Html.Events.Extra.Pointer.onLeave (eventToPointerEvent PointerLeave) |> Html.Attributes.map onMapMsg
+                    ]
+                        ++ (case model.pointerIsDown of
+                                Just _ ->
+                                    [ Html.Events.Extra.Pointer.onMove (eventToPointerEvent PointerMoved)
+                                        |> Html.Attributes.map onMapMsg
+                                    ]
+
+                                Nothing ->
+                                    []
+                           )
+
+                else
+                    []
+               )
+            ++ config.attributes
+        )
+        (WebGL.entityWith
+            []
+            vertexShader
+            fragmentShader
+            viewportSquare
+            { color = colorToVec4 config.fillColor
+            , matrix = Math.Matrix4.identity
+            }
+            :: List.concatMap
+                (\tiles ->
+                    background tiles
+                        ++ nature tiles
+                        ++ contour tiles
+                        ++ buildings tiles
+                        ++ roads True tiles
+                        ++ roads False tiles
+                        ++ roadLabels tiles
+                        ++ placeLabels tiles
+                )
+                visibleTiles
             ++ extraLayers
         )
+
+
+blend : WebGL.Settings.Setting
+blend =
+    WebGL.Settings.Blend.add WebGL.Settings.Blend.one WebGL.Settings.Blend.oneMinusSrcAlpha
 
 
 eventToPointerEvent : (PointerEvent -> msg) -> Html.Events.Extra.Pointer.Event -> msg
@@ -2134,27 +2341,6 @@ void main () {
     |]
 
 
-labelVertexShader : Shader LabelVertex { a | matrix : Mat4, offsetScale : Float } { color2 : Vec3 }
-labelVertexShader =
-    [glsl|
-
-attribute float positionX;
-attribute float positionY;
-attribute float offsetX;
-attribute float offsetY;
-attribute vec3 color;
-uniform mat4 matrix;
-uniform float offsetScale;
-varying vec3 color2;
-
-void main () {
-  gl_Position = matrix * vec4(vec2(positionX, positionY) + vec2(offsetX, offsetY) * offsetScale, 0.0, 1.0);
-  color2 = color;
-}
-
-|]
-
-
 roadVertexShader : Shader RoadVertex { a | matrix : Mat4, isOutline : Float, offsetScale : Float } { color2 : Vec3 }
 roadVertexShader =
     [glsl|
@@ -2189,13 +2375,47 @@ roadFragmentShader =
     |]
 
 
+labelVertexShader : Shader LabelVertex { a | matrix : Mat4, offsetScale : Float } { vTexCoord : Vec2 }
+labelVertexShader =
+    [glsl|
+
+attribute float positionX;
+attribute float positionY;
+attribute float offsetX;
+attribute float offsetY;
+attribute vec2 texCoord;
+uniform mat4 matrix;
+uniform float offsetScale;
+varying vec2 vTexCoord;
+
+void main () {
+  gl_Position = matrix * vec4(vec2(positionX, positionY) + vec2(offsetX, offsetY) * offsetScale, 0.0, 1.0);
+  vTexCoord = texCoord;
+}
+
+|]
+
+
+labelFragmentShader : Shader {} { a | fontTexture : WebGL.Texture.Texture } { vTexCoord : Vec2 }
+labelFragmentShader =
+    [glsl|
+        precision mediump float;
+        uniform sampler2D fontTexture;
+        varying vec2 vTexCoord;
+
+        void main () {
+            gl_FragColor = texture2D(fontTexture, vTexCoord);
+        }
+    |]
+
+
 
 ------ Vector tile decoding ------
 
 
 {-| -}
-type WorldCoordinates
-    = WorldCoordinates Never
+type MapCoordinates
+    = MapCoordinates Never
 
 
 type alias InternalStyle =
@@ -2203,7 +2423,6 @@ type alias InternalStyle =
     , ground : Vec4
     , buildings : Vec4
     , nature : Vec4
-    , background : Vec4
     , primaryRoad : Vec3
     , primaryRoadOutline : Vec3
     , primaryRoadLink : Vec3
@@ -2251,9 +2470,7 @@ type alias InternalStyle =
     , serviceRoad : Vec3
     , serviceRoadOutline : Vec3
     , placeLabel : Vec3
-    , placeLabelOutline : Vec3
     , roadLabel : Vec3
-    , roadLabelOutline : Vec3
     }
 
 
@@ -2305,10 +2522,10 @@ type alias TileWithText =
     , natureLayer : WebGL.Mesh Vertex
     , buildingLayer : WebGL.Mesh Vertex
     , roadLayer : WebGL.Mesh RoadVertex
-    , roadLabelLayer : WebGL.Mesh TextVertex
-    , placeLabelLayer : WebGL.Mesh TextVertex
-    , roadLabelChars : List (Point2d Unitless WorldCoordinates)
-    , placeLabelChars : List (Circle2d Unitless WorldCoordinates)
+    , roadLabelLayer : WebGL.Mesh LabelVertex
+    , placeLabelLayer : WebGL.Mesh LabelVertex
+    , roadLabelChars : List (Point2d Unitless MapCoordinates)
+    , placeLabelChars : List (Circle2d Unitless MapCoordinates)
     }
 
 
@@ -2364,7 +2581,7 @@ type alias RoadVertex =
 
 
 type alias LabelVertex =
-    { positionX : Float, positionY : Float, offsetX : Float, offsetY : Float, color : Vec3 }
+    { positionX : Float, positionY : Float, offsetX : Float, offsetY : Float, texCoord : Vec2 }
 
 
 type alias LandcoverBuilder =
@@ -2380,23 +2597,15 @@ type alias RoadBuilder =
 
 
 type alias RoadLabelBuilder =
-    { index : Int
-    , vertices : List TextVertex
-    , indices : List ( Int, Int, Int )
-    , newGlyphs : List (Point2d Unitless WorldCoordinates)
+    { vertices : List LabelVertex
+    , newGlyphs : List (Point2d Unitless MapCoordinates)
     }
 
 
 type alias PlaceLabelBuilder =
-    { index : Int
-    , vertices : List TextVertex
-    , indices : List ( Int, Int, Int )
-    , newGlyphs : List (Circle2d Unitless WorldCoordinates)
+    { vertices : List LabelVertex
+    , newGlyphs : List (Circle2d Unitless MapCoordinates)
     }
-
-
-type alias TextVertex =
-    { positionX : Float, positionY : Float, offsetX : Float, offsetY : Float, color : Vec3 }
 
 
 type alias Road =
@@ -2410,7 +2619,7 @@ tileToTileWithText :
     InternalStyle
     -> Float
     -> Font
-    -> { roadLabelChars : List (Point2d Unitless WorldCoordinates), placeLabelChars : List (Circle2d Unitless WorldCoordinates) }
+    -> { roadLabelChars : List (Point2d Unitless MapCoordinates), placeLabelChars : List (Circle2d Unitless MapCoordinates) }
     -> GridPoint
     -> Tile
     -> TileWithText
@@ -2419,13 +2628,22 @@ tileToTileWithText style devicePixelRatio font existingGlyphs tilePosition tile 
         placeLabels : PlaceLabelBuilder
         placeLabels =
             List.foldl
-                (drawPlaceLabels style devicePixelRatio font tilePosition)
-                { index = 0
-                , indices = []
-                , vertices = []
+                (\label state ->
+                    let
+                        { mesh, newGlyphs } =
+                            placeLabelMesh style devicePixelRatio font tilePosition label
+                    in
+                    { vertices = mesh ++ state.vertices
+                    , newGlyphs = newGlyphs ++ state.newGlyphs
+                    }
+                )
+                { vertices = []
                 , newGlyphs = []
                 }
                 tile.placeLabels
+
+        placeLabelIndices =
+            getQuadIndices placeLabels.vertices 0 []
 
         updatedExistingGlyphs =
             { roadLabelChars = existingGlyphs.roadLabelChars
@@ -2436,21 +2654,33 @@ tileToTileWithText style devicePixelRatio font existingGlyphs tilePosition tile 
         roadLabels =
             List.foldl
                 (\road builder ->
-                    drawRoadLabels style devicePixelRatio font updatedExistingGlyphs tilePosition builder road
+                    if tilePosition.zoom < 14 && not road.alwaysDrawLabel then
+                        builder
+
+                    else
+                        case roadLabelMeshV2 style devicePixelRatio font tilePosition builder.newGlyphs updatedExistingGlyphs road.path road.roadName of
+                            Just { mesh, newGlyphs } ->
+                                { vertices = mesh ++ builder.vertices
+                                , newGlyphs = newGlyphs ++ builder.newGlyphs
+                                }
+
+                            Nothing ->
+                                builder
                 )
-                { index = 0
-                , indices = []
-                , vertices = []
+                { vertices = []
                 , newGlyphs = []
                 }
                 tile.roads
+
+        roadLabelIndices =
+            getQuadIndices roadLabels.vertices 0 []
     in
     { waterLayer = tile.waterLayer
     , natureLayer = tile.natureLayer
     , buildingLayer = tile.buildingLayer
     , roadLayer = tile.roadLayer
-    , roadLabelLayer = WebGL.indexedTriangles (List.reverse roadLabels.vertices) roadLabels.indices
-    , placeLabelLayer = WebGL.indexedTriangles (List.reverse placeLabels.vertices) placeLabels.indices
+    , roadLabelLayer = WebGL.indexedTriangles roadLabels.vertices roadLabelIndices
+    , placeLabelLayer = WebGL.indexedTriangles placeLabels.vertices placeLabelIndices
     , roadLabelChars = roadLabels.newGlyphs
     , placeLabelChars = placeLabels.newGlyphs
     }
@@ -2634,9 +2864,9 @@ decodeBuildingGeometry feature builder =
            )
 
 
-getTags : { a | keys : Array String, values : Array Value } -> { b | tags : List Int } -> RegularDict.Dict String Value
+getTags : { a | keys : Array String, values : Array Value } -> { b | tags : List Int } -> Dict String Value
 getTags layer feature =
-    List.groupsOf 2 feature.tags
+    List.Extra.groupsOf 2 feature.tags
         |> List.map
             (\list ->
                 case list of
@@ -2655,7 +2885,7 @@ getTags layer feature =
                     _ ->
                         ( "bad key", StringValue "bad value" )
             )
-        |> RegularDict.fromList
+        |> Dict.fromList
 
 
 arrayFindIndex : (a -> Bool) -> Array a -> Maybe Int
@@ -2696,7 +2926,7 @@ getValueFromTag : Int -> List Int -> Maybe Int
 getValueFromTag tagIndex tags =
     case tags of
         key :: value :: rest ->
-            if key == tagIndex then
+            if key - tagIndex == 0 then
                 Just value
 
             else
@@ -2930,8 +3160,31 @@ decodeRoadGeometryV2 style roadBuilder layer feature =
                             }
                                 |> Just
 
-                        --"track" ->
-                        --    Nothing
+                        "service:driveway" ->
+                            { color = style.unclassifiedRoad
+                            , outlineColor = style.unclassifiedRoadOutline
+                            , width = 0.0005
+                            , alwaysDrawLabel = False
+                            }
+                                |> Just
+
+                        "track" ->
+                            -- Track as in country road, not train track
+                            { color = style.unclassifiedRoad
+                            , outlineColor = style.unclassifiedRoadOutline
+                            , width = 0.0005
+                            , alwaysDrawLabel = False
+                            }
+                                |> Just
+
+                        "bridleway" ->
+                            { color = style.unclassifiedRoad
+                            , outlineColor = style.unclassifiedRoadOutline
+                            , width = 0.0005
+                            , alwaysDrawLabel = False
+                            }
+                                |> Just
+
                         --
                         --"level_crossing" ->
                         --    Nothing
@@ -2968,7 +3221,7 @@ decodeRoadGeometryV2 style roadBuilder layer feature =
                         --
                         --"turning_loop" ->
                         --    Nothing
-                        _ ->
+                        a ->
                             Nothing
 
                 --name ->
@@ -3031,7 +3284,7 @@ decodeRoadGeometryV1 style roadBuilder layer feature =
 
         maybeName : Maybe String
         maybeName =
-            case RegularDict.get "name" tags of
+            case Dict.get "name" tags of
                 Just (StringValue value) ->
                     Just value
 
@@ -3040,7 +3293,7 @@ decodeRoadGeometryV1 style roadBuilder layer feature =
 
         maybeRoadData : Maybe { color : Vec3, outlineColor : Vec3, width : Float, alwaysDrawLabel : Bool }
         maybeRoadData =
-            case RegularDict.get "type" tags of
+            case Dict.get "type" tags of
                 Just (StringValue value) ->
                     case value of
                         "primary" ->
@@ -3266,19 +3519,13 @@ decodeRoadGeometryV1 style roadBuilder layer feature =
                         --"turning_loop" ->
                         --    Nothing
                         _ ->
-                            Nothing
+                            { color = Vec3.vec3 1 0 0
+                            , outlineColor = style.serviceRoadOutline
+                            , width = 0.001
+                            , alwaysDrawLabel = False
+                            }
+                                |> Just
 
-                --name ->
-                --    let
-                --        _ =
-                --            Debug.log "" name
-                --    in
-                --    { color = Vec3.vec3 1 0 0
-                --    , outlineColor = style.serviceRoadOutline
-                --    , width = 0.001
-                --    , alwaysDrawLabel = False
-                --    }
-                --        |> Just
                 _ ->
                     Nothing
     in
@@ -3294,21 +3541,21 @@ decodeRoadGeometryV1 style roadBuilder layer feature =
             roadBuilder
 
 
-gridMinCornerToPoint : GridPoint -> Point2d Unitless WorldCoordinates
+gridMinCornerToPoint : GridPoint -> Point2d Unitless MapCoordinates
 gridMinCornerToPoint gridPoint =
     Point2d.unitless
         (toFloat gridPoint.gridX / 2 ^ toFloat gridPoint.zoom)
         (toFloat gridPoint.gridY / 2 ^ toFloat gridPoint.zoom)
 
 
-gridMaxCornerToPoint : GridPoint -> Point2d Unitless WorldCoordinates
+gridMaxCornerToPoint : GridPoint -> Point2d Unitless MapCoordinates
 gridMaxCornerToPoint gridPoint =
     Point2d.unitless
         (toFloat (gridPoint.gridX + 1) / 2 ^ toFloat gridPoint.zoom)
         (toFloat (gridPoint.gridY + 1) / 2 ^ toFloat gridPoint.zoom)
 
 
-tileCoordToWorld : GridPoint -> Point2d Unitless Unitless -> Point2d Unitless WorldCoordinates
+tileCoordToWorld : GridPoint -> Point2d Unitless Unitless -> Point2d Unitless MapCoordinates
 tileCoordToWorld tilePosition point =
     let
         v =
@@ -3343,16 +3590,28 @@ placeLabelGlyphScale class =
 
 roadGlyphRadius : Float -> Font -> Int -> Quantity Float Unitless
 roadGlyphRadius devicePixelRatio font zoom =
-    (toFloat (font.bboxTop - font.bboxBottom) / (roadGlyphScale * 2))
+    (toFloat font.fontSize * scaleAdjust / (roadGlyphScale * 2))
         |> (*) (devicePixelRatio / 2 ^ toFloat zoom)
         |> Quantity.float
 
 
 placeLabelGlyphRadius : Float -> Font -> Int -> PlaceClass -> Quantity Float Unitless
 placeLabelGlyphRadius devicePixelRatio font zoom class =
-    (toFloat (font.bboxTop - font.bboxBottom) / (placeLabelGlyphScale class * 2))
+    (toFloat font.fontSize * scaleAdjust / (placeLabelGlyphScale class * 2))
         |> (*) (devicePixelRatio / 2 ^ toFloat zoom)
         |> Quantity.float
+
+
+scaleAdjust =
+    20
+
+
+fontTextureWidth =
+    1024
+
+
+fontTextureHeight =
+    1024
 
 
 roadLabelMeshV2 :
@@ -3360,29 +3619,20 @@ roadLabelMeshV2 :
     -> Float
     -> Font
     -> GridPoint
-    -> List (Point2d Unitless WorldCoordinates)
-    -> { roadLabelChars : List (Point2d Unitless WorldCoordinates), placeLabelChars : List (Circle2d Unitless WorldCoordinates) }
+    -> List (Point2d Unitless MapCoordinates)
+    -> { roadLabelChars : List (Point2d Unitless MapCoordinates), placeLabelChars : List (Circle2d Unitless MapCoordinates) }
     -> Nonempty (Point2d Unitless Unitless)
     -> String
-    -> Maybe { mesh : TriangularMesh LabelVertex, newGlyphs : List (Point2d Unitless WorldCoordinates) }
+    -> Maybe { mesh : List LabelVertex, newGlyphs : List (Point2d Unitless MapCoordinates) }
 roadLabelMeshV2 style devicePixelRatio font tilePosition newGlyphs existingChars path text =
     let
         glyphs : List Glyph
         glyphs =
-            String.toList text
-                |> List.map
-                    (\char ->
-                        case RegularDict.get char font.glyphs of
-                            Just glyph_ ->
-                                glyph_
-
-                            Nothing ->
-                                font.missingGlyph
-                    )
+            String.toList text |> List.filterMap (\char -> Dict.get char font.glyphs)
 
         width : Quantity Float Unitless
         width =
-            List.map (\glyph -> glyph.horizontalAdvance) glyphs
+            List.map (\a -> a.xAdvance * scaleAdjust) glyphs
                 |> List.sum
                 |> toFloat
                 |> (*) (1 / roadGlyphScale)
@@ -3434,7 +3684,7 @@ roadLabelMeshV2 style devicePixelRatio font tilePosition newGlyphs existingChars
                     in
                     if Direction2d.angleFrom start.direction direction |> Quantity.abs |> Quantity.lessThan (Angle.degrees 45) then
                         { list =
-                            TriangularMesh.mapVertices
+                            List.map
                                 (\glyphPoint ->
                                     let
                                         glyphPosition =
@@ -3444,35 +3694,30 @@ roadLabelMeshV2 style devicePixelRatio font tilePosition newGlyphs existingChars
                                             Point2d.unwrap position
 
                                         x =
-                                            (glyphPosition.x + toFloat font.bboxRight / -2) / roadGlyphScale
+                                            glyphPosition.x / roadGlyphScale
 
                                         y =
-                                            (glyphPosition.y + toFloat font.capHeight / -2) / -roadGlyphScale
+                                            -(glyphPosition.y + toFloat (font.lineHeight * scaleAdjust) / -2) / -roadGlyphScale
 
                                         angle =
-                                            Direction2d.toAngle direction |> Angle.inRadians
+                                            Direction2d.toAngle direction
 
                                         cos2 =
-                                            cos angle
+                                            Angle.cos angle
 
                                         sin2 =
-                                            sin angle
+                                            Angle.sin angle
                                     in
                                     { positionX = centerPosition.x
                                     , positionY = centerPosition.y
                                     , offsetX = (cos2 * x - sin2 * y) + position2.x - centerPosition.x
                                     , offsetY = (sin2 * x + cos2 * y) + position2.y - centerPosition.y
-                                    , color =
-                                        if glyphPoint.isOutline then
-                                            style.roadLabelOutline
-
-                                        else
-                                            style.roadLabel
+                                    , texCoord = Point2d.toVec2 glyphPoint.texCoord
                                     }
                                 )
-                                glyph.path
-                                :: state.list
-                        , offset = state.offset + glyph.horizontalAdvance
+                                (getGlyph glyph)
+                                ++ state.list
+                        , offset = state.offset + glyph.xAdvance * scaleAdjust
                         , newGlyphs = tileCoordToWorld tilePosition position :: state.newGlyphs
                         , isTooCurvy = state.isTooCurvy
                         }
@@ -3496,7 +3741,7 @@ roadLabelMeshV2 style devicePixelRatio font tilePosition newGlyphs existingChars
                             && checkCollisions (roadLabelCharCollision devicePixelRatio font tilePosition.zoom) state.newGlyphs newGlyphs
                     then
                         Just
-                            { mesh = TriangularMesh.combine state.list
+                            { mesh = state.list
                             , newGlyphs = state.newGlyphs
                             }
 
@@ -3516,21 +3761,12 @@ placeLabelMesh :
     -> Font
     -> GridPoint
     -> PlaceLabel
-    -> { mesh : TriangularMesh LabelVertex, newGlyphs : List (Circle2d Unitless WorldCoordinates) }
+    -> { mesh : List LabelVertex, newGlyphs : List (Circle2d Unitless MapCoordinates) }
 placeLabelMesh style devicePixelRatio font tilePosition label =
     let
         glyphs : List Glyph
         glyphs =
-            String.toList label.text
-                |> List.map
-                    (\char ->
-                        case RegularDict.get char font.glyphs of
-                            Just glyph_ ->
-                                glyph_
-
-                            Nothing ->
-                                font.missingGlyph
-                    )
+            String.toList label.text |> List.filterMap (\char -> Dict.get char font.glyphs)
 
         scale : number
         scale =
@@ -3540,7 +3776,7 @@ placeLabelMesh style devicePixelRatio font tilePosition label =
             -800 / scale
 
         halfFontHeight =
-            toFloat font.capHeight / (2 * scale)
+            toFloat (scaleAdjust * font.lineHeight) / (-2 * scale)
 
         { offsetX, offsetY } =
             case label.textAnchor of
@@ -3554,16 +3790,16 @@ placeLabelMesh style devicePixelRatio font tilePosition label =
                     { offsetX = 0, offsetY = halfFontHeight }
 
                 Top ->
-                    { offsetX = -1 / (2 * scale), offsetY = -marginY - halfFontHeight }
+                    { offsetX = -1 / (2 * scale), offsetY = 0 }
 
                 Bottom ->
                     { offsetX = -1 / (2 * scale), offsetY = marginY + halfFontHeight }
 
                 TopRight ->
-                    { offsetX = -1 / scale, offsetY = -marginY - halfFontHeight }
+                    { offsetX = -1 / scale, offsetY = 0 }
 
                 TopLeft ->
-                    { offsetX = 0, offsetY = -marginY - halfFontHeight }
+                    { offsetX = 0, offsetY = 0 }
 
                 BottomRight ->
                     { offsetX = -1 / scale, offsetY = marginY + halfFontHeight }
@@ -3573,12 +3809,13 @@ placeLabelMesh style devicePixelRatio font tilePosition label =
 
         startPosition : Point2d Unitless Unitless
         startPosition =
-            List.map (\glyph -> glyph.horizontalAdvance) glyphs
+            List.map (\a -> a.xAdvance * scaleAdjust) glyphs
                 |> List.sum
                 |> toFloat
                 |> (*) offsetX
                 |> (\x -> Point2d.translateBy (Vector2d.unitless x offsetY) Point2d.origin)
 
+        labelPoint : { x : Float, y : Float }
         labelPoint =
             Point2d.unwrap label.position
     in
@@ -3591,13 +3828,12 @@ placeLabelMesh style devicePixelRatio font tilePosition label =
                         startPosition
             in
             { list =
-                TriangularMesh.mapVertices
+                List.map
                     (\glyphPoint ->
                         let
                             { x, y } =
                                 glyphPoint.position
                                     |> Point2d.scaleAbout Point2d.origin (1 / scale)
-                                    |> Point2d.mirrorAcross Axis2d.x
                                     |> Point2d.translateBy (Vector2d.from Point2d.origin position)
                                     |> Point2d.unwrap
                         in
@@ -3605,17 +3841,12 @@ placeLabelMesh style devicePixelRatio font tilePosition label =
                         , positionY = labelPoint.y
                         , offsetX = x
                         , offsetY = y
-                        , color =
-                            if glyphPoint.isOutline then
-                                style.placeLabelOutline
-
-                            else
-                                style.placeLabel
+                        , texCoord = Point2d.toVec2 glyphPoint.texCoord
                         }
                     )
-                    glyph.path
-                    :: state.list
-            , offset = state.offset + glyph.horizontalAdvance
+                    (getGlyph glyph)
+                    ++ state.list
+            , offset = state.offset + glyph.xAdvance * scaleAdjust
             , newGlyphs =
                 Circle2d.withRadius
                     (placeLabelGlyphRadius devicePixelRatio font tilePosition.zoom label.class)
@@ -3631,10 +3862,7 @@ placeLabelMesh style devicePixelRatio font tilePosition label =
         )
         { list =
             if label.isCapital then
-                [ ring 10 (240 / scale) (160 / scale) label.position (Vec3.vec3 0 0 0)
-                , circle 10 (100 / scale) label.position (Vec3.vec3 0 0 0)
-                , circle 10 (280 / scale) label.position (Vec3.vec3 1 1 1)
-                ]
+                placeLabelPoint '°' labelPoint scale font
 
             else
                 case label.class of
@@ -3645,115 +3873,102 @@ placeLabelMesh style devicePixelRatio font tilePosition label =
                         []
 
                     Settlement ->
-                        [ circle 10 (160 / scale) label.position (Vec3.vec3 0 0 0)
-                        , circle 10 (200 / scale) label.position (Vec3.vec3 1 1 1)
-                        ]
+                        placeLabelPoint '•' labelPoint scale font
 
                     SettlementSubdivision ->
-                        [ circle 10 (160 / scale) label.position (Vec3.vec3 0 0 0)
-                        , circle 10 (200 / scale) label.position (Vec3.vec3 1 1 1)
-                        ]
+                        placeLabelPoint '•' labelPoint scale font
         , offset = 0
         , newGlyphs = []
         }
         glyphs
         |> (\state ->
-                { mesh = List.reverse state.list |> TriangularMesh.combine, newGlyphs = state.newGlyphs }
+                { mesh = state.list, newGlyphs = state.newGlyphs }
            )
 
 
-ring : Int -> Float -> Float -> Point2d a b -> Vec3 -> TriangularMesh LabelVertex
-ring detail outerRadius innerRadius position color =
+placeLabelPoint :
+    Char
+    -> { x : Float, y : Float }
+    -> Float
+    -> Font
+    -> List { positionX : Float, positionY : Float, offsetX : Float, offsetY : Float, texCoord : Vec2 }
+placeLabelPoint char labelPoint scale font =
+    case Dict.get char font.glyphs of
+        Just glyph ->
+            List.map
+                (\glyphPoint ->
+                    let
+                        { x, y } =
+                            glyphPoint.position
+                                |> Point2d.scaleAbout Point2d.origin (1 / scale)
+                                |> Point2d.unwrap
+                    in
+                    { positionX = labelPoint.x
+                    , positionY = labelPoint.y
+                    , offsetX = x
+                    , offsetY = y
+                    , texCoord = Point2d.toVec2 glyphPoint.texCoord
+                    }
+                )
+                (getGlyph
+                    { xOffset = -glyph.width // 2
+                    , yOffset = -glyph.height // 2
+                    , width = glyph.width
+                    , height = glyph.height
+                    , x = glyph.x
+                    , y = glyph.y
+                    }
+                )
+
+        Nothing ->
+            []
+
+
+getGlyph :
+    { a | xOffset : Int, yOffset : Int, width : Int, height : Int, x : Int, y : Int }
+    -> List { position : Point2d Unitless coordinates, texCoord : Point2d Unitless coordinates }
+getGlyph glyph =
     let
-        { x, y } =
-            Point2d.unwrap position
+        x0 =
+            toFloat glyph.xOffset * scaleAdjust
 
-        outerVertices : List LabelVertex
-        outerVertices =
-            List.range 0 (detail - 1)
-                |> List.map
-                    (\index ->
-                        let
-                            t =
-                                toFloat index * (2 * pi / toFloat detail)
-                        in
-                        { positionX = x
-                        , positionY = y
-                        , offsetX = cos t * outerRadius
-                        , offsetY = sin t * outerRadius
-                        , color = color
-                        }
-                    )
+        y0 =
+            toFloat glyph.yOffset * scaleAdjust
 
-        innerVertices : List LabelVertex
-        innerVertices =
-            List.range 0 (detail - 1)
-                |> List.map
-                    (\index ->
-                        let
-                            t =
-                                toFloat index * (2 * pi / toFloat detail)
-                        in
-                        { positionX = x
-                        , positionY = y
-                        , offsetX = cos t * innerRadius
-                        , offsetY = sin t * innerRadius
-                        , color = color
-                        }
-                    )
+        x1 =
+            toFloat (glyph.xOffset + glyph.width) * scaleAdjust
 
-        indices : List ( Int, Int, Int )
-        indices =
-            List.range 0 (detail - 1)
-                |> List.concatMap
-                    (\index ->
-                        [ ( index
-                          , detail + modBy detail (index + 1)
-                          , detail + index
-                          )
-                        , ( index
-                          , modBy detail (index + 1)
-                          , detail + modBy detail (index + 1)
-                          )
-                        ]
-                    )
+        y1 =
+            toFloat (glyph.yOffset + glyph.height) * scaleAdjust
+
+        texX0 =
+            toFloat glyph.x / fontTextureWidth
+
+        texY0 =
+            1 - toFloat glyph.y / fontTextureHeight
+
+        texX1 =
+            toFloat (glyph.x + glyph.width) / fontTextureWidth
+
+        texY1 =
+            1 - toFloat (glyph.y + glyph.height) / fontTextureHeight
     in
-    TriangularMesh.indexed (innerVertices ++ outerVertices |> Array.fromList) indices
+    [ { position = Point2d.unitless x0 y0
+      , texCoord = Point2d.unitless texX0 texY0
+      }
+    , { position = Point2d.unitless x0 y1
+      , texCoord = Point2d.unitless texX0 texY1
+      }
+    , { position = Point2d.unitless x1 y1
+      , texCoord = Point2d.unitless texX1 texY1
+      }
+    , { position = Point2d.unitless x1 y0
+      , texCoord = Point2d.unitless texX1 texY0
+      }
+    ]
 
 
-circle : Int -> Float -> Point2d a b -> Vec3 -> TriangularMesh LabelVertex
-circle detail radius position color =
-    let
-        { x, y } =
-            Point2d.unwrap position
-
-        vertices : Array LabelVertex
-        vertices =
-            List.range 0 (detail - 1)
-                |> List.map
-                    (\index ->
-                        let
-                            t =
-                                toFloat index * (2 * pi / toFloat detail)
-                        in
-                        { positionX = x
-                        , positionY = y
-                        , offsetX = cos t * radius
-                        , offsetY = sin t * radius
-                        , color = color
-                        }
-                    )
-                |> Array.fromList
-
-        indices : List ( Int, Int, Int )
-        indices =
-            List.range 0 (detail - 2)
-                |> List.map (\index -> ( 0, index + 2, index + 1 ))
-    in
-    TriangularMesh.indexed vertices indices
-
-
-roadLabelCharCollision : Float -> Font -> Int -> Point2d Unitless WorldCoordinates -> Point2d Unitless WorldCoordinates -> Bool
+roadLabelCharCollision : Float -> Font -> Int -> Point2d Unitless MapCoordinates -> Point2d Unitless MapCoordinates -> Bool
 roadLabelCharCollision devicePixelRatio font zoom a b =
     Point2d.distanceFrom a b |> Quantity.lessThan (roadGlyphRadius devicePixelRatio font zoom |> Quantity.multiplyBy 2)
 
@@ -3827,90 +4042,20 @@ pathLength path =
         |> Polyline2d.length
 
 
-drawRoadLabels :
-    InternalStyle
-    -> Float
-    -> Font
-    -> { roadLabelChars : List (Point2d Unitless WorldCoordinates), placeLabelChars : List (Circle2d Unitless WorldCoordinates) }
-    -> GridPoint
-    -> RoadLabelBuilder
-    -> Road
-    -> RoadLabelBuilder
-drawRoadLabels style devicePixelRatio font existingChars tilePosition textBuilder road =
-    if tilePosition.zoom < 14 && not road.alwaysDrawLabel then
-        textBuilder
-
-    else
-        case roadLabelMeshV2 style devicePixelRatio font tilePosition textBuilder.newGlyphs existingChars road.path road.roadName of
-            Just { mesh, newGlyphs } ->
-                let
-                    vertices : Array LabelVertex
-                    vertices =
-                        TriangularMesh.vertices mesh
-
-                    indices : List ( Int, Int, Int )
-                    indices =
-                        TriangularMesh.faceIndices mesh
-
-                    maxIndex : Int
-                    maxIndex =
-                        List.map (\( a, b, c ) -> max a b |> max c) indices
-                            |> List.maximum
-                            |> Maybe.withDefault 0
-                in
-                { index = textBuilder.index + maxIndex + 1
-                , vertices = List.reverse (Array.toList vertices) ++ textBuilder.vertices
-                , indices =
-                    List.map
-                        (\( a, b, c ) ->
-                            ( a + textBuilder.index
-                            , b + textBuilder.index
-                            , c + textBuilder.index
-                            )
-                        )
-                        indices
-                        ++ textBuilder.indices
-                , newGlyphs = newGlyphs ++ textBuilder.newGlyphs
-                }
-
-            Nothing ->
-                textBuilder
-
-
-drawPlaceLabels : InternalStyle -> Float -> Font -> GridPoint -> PlaceLabel -> PlaceLabelBuilder -> PlaceLabelBuilder
-drawPlaceLabels style devicePixelRatio font tilePosition label placeLabelBuilder =
-    let
-        { mesh, newGlyphs } =
-            placeLabelMesh style devicePixelRatio font tilePosition label
-
-        vertices : Array LabelVertex
-        vertices =
-            TriangularMesh.vertices mesh
-
-        indices : List ( Int, Int, Int )
-        indices =
-            TriangularMesh.faceIndices mesh
-
-        maxIndex : Int
-        maxIndex =
-            List.map (\( a, b, c ) -> max a b |> max c) indices
-                |> List.maximum
-                |> Maybe.withDefault 0
-    in
-    { index = placeLabelBuilder.index + maxIndex + 1
-    , vertices = List.reverse (Array.toList vertices) ++ placeLabelBuilder.vertices
-    , indices =
-        List.map
-            (\( a, b, c ) ->
-                ( a + placeLabelBuilder.index
-                , b + placeLabelBuilder.index
-                , c + placeLabelBuilder.index
+getQuadIndices : List a -> Int -> List ( Int, Int, Int ) -> List ( Int, Int, Int )
+getQuadIndices list indexOffset newList =
+    case list of
+        _ :: _ :: _ :: _ :: rest ->
+            getQuadIndices
+                rest
+                (indexOffset + 1)
+                (( 4 * indexOffset + 3, 4 * indexOffset + 1, 4 * indexOffset )
+                    :: ( 4 * indexOffset + 2, 4 * indexOffset + 1, 4 * indexOffset + 3 )
+                    :: newList
                 )
-            )
-            indices
-            ++ placeLabelBuilder.indices
-    , newGlyphs = newGlyphs ++ placeLabelBuilder.newGlyphs
-    }
+
+        _ ->
+            newList
 
 
 decodeRoadGeometryHelper :
@@ -4105,13 +4250,13 @@ layerTempToLayer style tilePosition layer =
             List.foldl
                 (\feature state ->
                     let
-                        tags : RegularDict.Dict String Value
+                        tags : Dict String Value
                         tags =
                             getTags layer feature
 
                         maybeClass : Maybe PlaceClass
                         maybeClass =
-                            case RegularDict.get "class" tags of
+                            case Dict.get "class" tags of
                                 Just (StringValue text) ->
                                     case text of
                                         "country" ->
@@ -4132,7 +4277,7 @@ layerTempToLayer style tilePosition layer =
                                 _ ->
                                     Nothing
                     in
-                    case ( RegularDict.get "name" tags, maybeClass, RegularDict.get "symbolrank" tags ) of
+                    case ( Dict.get "name" tags, maybeClass, Dict.get "symbolrank" tags ) of
                         ( Just (StringValue label), Just class, Just (Uint64Value symbolRank) ) ->
                             case Decode.decode (pointDecoder (Bytes.width feature.mesh)) feature.mesh of
                                 Just point ->
@@ -4144,7 +4289,7 @@ layerTempToLayer style tilePosition layer =
                                         symbolRank_ =
                                             Int64.toInt symbolRank
                                     in
-                                    if x < 0 || y < 0 || x > 1 || y > 1 || symbolRank_ - 3 > tilePosition.zoom then
+                                    if x < 0 || y < 0 || x > 1 || y > 1 || (symbolRank_ - 3) - tilePosition.zoom > 0 then
                                         state
 
                                     else
@@ -4152,10 +4297,19 @@ layerTempToLayer style tilePosition layer =
                                         , position = point
                                         , class = class
                                         , isCapital =
-                                            RegularDict.get "capital" tags
-                                                == Just (Uint64Value (Int64.fromInt 2))
+                                            case Dict.get "capital" tags of
+                                                Just a ->
+                                                    case a of
+                                                        Uint64Value b ->
+                                                            Int64.toInt b == 2
+
+                                                        _ ->
+                                                            False
+
+                                                Nothing ->
+                                                    False
                                         , textAnchor =
-                                            case RegularDict.get "text_anchor" tags of
+                                            case Dict.get "text_anchor" tags of
                                                 Just (StringValue anchorText) ->
                                                     toTextAnchor anchorText
 
