@@ -7,6 +7,7 @@ import CssPixels exposing (CssPixels)
 import Direction2d
 import Geometry.Interop.LinearAlgebra.Point2d as Point2d
 import Html exposing (Html)
+import Html.Attributes
 import List.Extra
 import LngLat exposing (LngLat)
 import MapViewer exposing (MapCoordinates)
@@ -181,15 +182,15 @@ update msg model =
                                             in
                                             case Direction2d.from worldPosition point of
                                                 Just direction ->
-                                                    let
-                                                        distance : Quantity Float Unitless
-                                                        distance =
-                                                            MapViewer.canvasToWorld
-                                                                Point2d.distanceFrom
-                                                                canvasPosition
-                                                                point
-                                                                |> Debug.log "a"
-                                                    in
+                                                    --let
+                                                    --    distance : Quantity Float Unitless
+                                                    --    distance =
+                                                    --        MapViewer.canvasToWorld
+                                                    --            Point2d.distanceFrom
+                                                    --            canvasPosition
+                                                    --            point
+                                                    --            |> Debug.log "a"
+                                                    --in
                                                     Direction2d.angleFrom Direction2d.y direction
                                                         |> Quantity.abs
                                                         |> Quantity.lessThan (Angle.degrees 24)
@@ -342,6 +343,12 @@ view model =
             MapMsg
             model.mapData
             model.map
+        , Html.div
+            [ Html.Attributes.style "font-family" "sans-serif"
+            , Html.Attributes.style "transform" "translateY(-24px)"
+            , Html.Attributes.style "display" "inline-block"
+            ]
+            [ MapViewer.attribution ]
         ]
 
 

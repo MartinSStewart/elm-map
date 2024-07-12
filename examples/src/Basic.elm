@@ -4,6 +4,7 @@ import Angle
 import Browser
 import CssPixels
 import Html exposing (Html)
+import Html.Attributes
 import Http
 import MapViewer
 import Pixels
@@ -77,4 +78,13 @@ subscriptions model =
 
 view : Model -> Html Msg
 view model =
-    MapViewer.view MapMsg model.mapData model.map
+    Html.div
+        []
+        [ MapViewer.view MapMsg model.mapData model.map
+        , Html.div
+            [ Html.Attributes.style "font-family" "sans-serif"
+            , Html.Attributes.style "transform" "translateY(-24px)"
+            , Html.Attributes.style "display" "inline-block"
+            ]
+            [ MapViewer.attribution ]
+        ]
