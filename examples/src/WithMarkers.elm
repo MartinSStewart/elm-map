@@ -2,6 +2,7 @@ module WithMarkers exposing (main)
 
 import Angle
 import Browser
+import Browser.Events
 import Camera3d exposing (Camera3d)
 import CssPixels exposing (CssPixels)
 import Direction2d
@@ -18,6 +19,7 @@ import Math.Vector4 exposing (Vec4)
 import Point2d exposing (Point2d)
 import Quantity exposing (Quantity, Unitless)
 import Task
+import Vector2d
 import WebGL exposing (Shader)
 import WebGL.Matrices
 import WebGL.Settings.Blend as Blend
@@ -115,11 +117,19 @@ points =
     ]
 
 
-lngLatToQuad : Quantity Float CssPixels -> Float -> Int -> LngLat -> List MapMarkerVertex
-lngLatToQuad height aspectRatio id lngLat =
+lngLatToQuad :
+    Quantity Float CssPixels
+    -> Float
+    -> Point2d Unitless MapCoordinates
+    -> Int
+    -> LngLat
+    -> List MapMarkerVertex
+lngLatToQuad height aspectRatio center id lngLat =
     let
         position =
-            MapViewer.lngLatToWorld lngLat |> Point2d.toVec2
+            MapViewer.lngLatToWorld lngLat
+                |> Point2d.translateBy (Vector2d.from center Point2d.origin)
+                |> Point2d.toVec2
 
         color =
             Vec3.vec3 1 0 0
@@ -220,14 +230,16 @@ update msg model =
 
                                 aspectRatio =
                                     toFloat textureWidth / toFloat textureHeight
-                            in
-                            TextureLoaded
-                                { center =
+
+                                center =
                                     Point2d.centroidN (List.map MapViewer.lngLatToWorld points)
                                         |> Maybe.withDefault Point2d.origin
+                            in
+                            TextureLoaded
+                                { center = center
                                 , texture = texture
                                 , mesh =
-                                    List.indexedMap (lngLatToQuad (CssPixels.cssPixels 60) aspectRatio) points
+                                    List.indexedMap (lngLatToQuad (CssPixels.cssPixels 60) aspectRatio center) points
                                         |> List.concat
                                         |> quadsToMesh
                                 }
@@ -312,8 +324,7 @@ view model =
                                 , farClipDepth = Quantity.float (1000 / zoom)
                                 , aspectRatio = aspectRatio
                                 }
-
-                        --|> Math.Matrix4.translate3 x y 0
+                                |> Math.Matrix4.translate3 x y 0
                     in
                     [ WebGL.entityWith
                         [ Blend.add Blend.srcAlpha Blend.oneMinusSrcAlpha ]
@@ -343,12 +354,6 @@ view model =
             MapMsg
             model.mapData
             model.map
-        , Html.div
-            [ Html.Attributes.style "font-family" "sans-serif"
-            , Html.Attributes.style "transform" "translateY(-24px)"
-            , Html.Attributes.style "display" "inline-block"
-            ]
-            [ MapViewer.attribution ]
         ]
 
 
