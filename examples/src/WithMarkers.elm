@@ -17,6 +17,7 @@ import Quantity exposing (Unitless)
 import Task
 import WebGL exposing (Shader)
 import WebGL.Matrices
+import WebGL.Settings.Blend as Blend
 import WebGL.Texture exposing (Texture)
 import ZoomLevel
 
@@ -93,7 +94,7 @@ init _ =
         , minify = WebGL.Texture.linear
         , horizontalWrap = WebGL.Texture.clampToEdge
         , verticalWrap = WebGL.Texture.clampToEdge
-        , flipY = False
+        , flipY = True
         }
         "https://raw.githubusercontent.com/MartinSStewart/elm-map/master/public/mapMarker.png"
         |> Task.attempt GotMapMarkerTexture
@@ -103,13 +104,13 @@ init _ =
 points : List LngLat
 points =
     [ { lng = Angle.degrees 0, lat = Angle.degrees 40 }
-    , { lng = Angle.degrees 0.1, lat = Angle.degrees 40 }
-    , { lng = Angle.degrees 0.2, lat = Angle.degrees 40.1 }
+    , { lng = Angle.degrees 0.1, lat = Angle.degrees 40.1 }
+    , { lng = Angle.degrees 0.2, lat = Angle.degrees 40.2 }
     ]
 
 
-lngLatToQuad : LngLat -> List MapMarkerVertex
-lngLatToQuad lngLat =
+lngLatToQuad : Float -> Float -> LngLat -> List MapMarkerVertex
+lngLatToQuad size aspectRatio lngLat =
     let
         position =
             MapViewer.lngLatToWorld lngLat |> Point2d.toVec2
@@ -118,22 +119,22 @@ lngLatToQuad lngLat =
             Vec3.vec3 1 0 0
     in
     [ { position = position
-      , offset = Vec2.vec2 0 1
+      , offset = Vec2.vec2 (-size * aspectRatio / 2) size
       , texPosition = Vec2.vec2 0 1
       , color = color
       }
     , { position = position
-      , offset = Vec2.vec2 1 1
+      , offset = Vec2.vec2 (size * aspectRatio / 2) size
       , texPosition = Vec2.vec2 1 1
       , color = color
       }
     , { position = position
-      , offset = Vec2.vec2 1 0
+      , offset = Vec2.vec2 (size * aspectRatio / 2) 0
       , texPosition = Vec2.vec2 1 0
       , color = color
       }
     , { position = position
-      , offset = Vec2.vec2 0 0
+      , offset = Vec2.vec2 (-size * aspectRatio / 2) 0
       , texPosition = Vec2.vec2 0 0
       , color = color
       }
@@ -155,12 +156,19 @@ update msg model =
                 | mapMarkers =
                     case result of
                         Ok texture ->
+                            let
+                                ( textureWidth, textureHeight ) =
+                                    WebGL.Texture.size texture
+
+                                aspectRatio =
+                                    toFloat textureWidth / toFloat textureHeight
+                            in
                             TextureLoaded
                                 { center =
                                     Point2d.centroidN (List.map MapViewer.lngLatToWorld points)
                                         |> Maybe.withDefault Point2d.origin
                                 , texture = texture
-                                , mesh = List.concatMap lngLatToQuad points |> quadsToMesh
+                                , mesh = List.concatMap (lngLatToQuad 0.2 aspectRatio) points |> quadsToMesh
                                 }
 
                         Err error ->
@@ -212,7 +220,7 @@ view model =
             TextureFailedToLoad _ ->
                 Html.div [] [ Html.text "There was an error while loading the map maker texture" ]
         , MapViewer.viewWith
-            { inputsEnabled = False
+            { inputsEnabled = True
             , overrideCamera = Nothing
             , attributes = []
             , fillColor = MapViewer.defaultStyle.ground
@@ -243,10 +251,11 @@ view model =
                                 , farClipDepth = Quantity.float (1000 / zoom)
                                 , aspectRatio = aspectRatio
                                 }
-                                |> Math.Matrix4.translate3 x y 0
+
+                        --|> Math.Matrix4.translate3 x y 0
                     in
                     [ WebGL.entityWith
-                        []
+                        [ Blend.add Blend.srcAlpha Blend.oneMinusSrcAlpha ]
                         mapMarkerVertexShader
                         mapMarkerFragmentShader
                         mesh
@@ -297,9 +306,7 @@ varying vec4 vColor;
 void main () {
     //into clip space
     vec4 currentProjected = view * vec4(position, 0.0, 1.0);
-
-    gl_Position =
-        currentProjected + vec4( vec2(offset.x / aspect,offset.y) * currentProjected.w, 0.0, 0.0);
+    gl_Position = currentProjected + vec4( vec2(offset.x / aspect,offset.y) * currentProjected.w, 0.0, 0.0);
     vTexPosition = texPosition;
     vColor = vec4(color, 1.0);
 }
