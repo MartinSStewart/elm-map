@@ -10,7 +10,7 @@ This package has no JS dependencies meaning you don't need to mess with ports or
 
 To view the example maps run the following commands in your terminal
 ```
-cd example
+cd examples
 elm reactor
 ```
 and then open localhost:8000 in your browser and select the module you want to view
