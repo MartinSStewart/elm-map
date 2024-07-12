@@ -108,8 +108,8 @@ init _ =
     )
 
 
-points : List LngLat
-points =
+mapMarkerPoints : List LngLat
+mapMarkerPoints =
     [ { lng = Angle.degrees 0, lat = Angle.degrees 40 }
     , { lng = Angle.degrees 0.1, lat = Angle.degrees 40.1 }
     , { lng = Angle.degrees 0.2, lat = Angle.degrees 40.2 }
@@ -170,23 +170,25 @@ update msg model =
             let
                 { newModel, newMapData, outMsg, cmd } =
                     MapViewer.update mapboxApiKey model.mapData mapMsg model.map
-
-                maybeSelected =
+            in
+            ( { model
+                | map = newModel
+                , mapData = newMapData
+                , selectedMapMarker =
                     case outMsg of
                         Just (MapViewer.PointerPressed _) ->
                             model.selectedMapMarker
 
                         Just (MapViewer.PointerReleased { canvasPosition, dragDistance }) ->
                             if dragDistance |> Quantity.lessThan (CssPixels.cssPixels 16) then
-                                List.Extra.findIndex (insideMapMarker newModel canvasPosition) points
+                                List.Extra.findIndex (insideMapMarker newModel canvasPosition) mapMarkerPoints
 
                             else
                                 model.selectedMapMarker
 
                         Nothing ->
                             model.selectedMapMarker
-            in
-            ( { model | map = newModel, mapData = newMapData, selectedMapMarker = maybeSelected }
+              }
             , Cmd.map MapMsg cmd
             )
 
@@ -199,18 +201,21 @@ update msg model =
                                 ( textureWidth, textureHeight ) =
                                     WebGL.Texture.size texture
 
+                                aspectRatio : Float
                                 aspectRatio =
                                     toFloat textureWidth / toFloat textureHeight
 
+                                center : Point2d Unitless MapCoordinates
                                 center =
-                                    Point2d.centroidN (List.map MapViewer.lngLatToWorld points)
+                                    Point2d.centroidN (List.map MapViewer.lngLatToWorld mapMarkerPoints)
                                         |> Maybe.withDefault Point2d.origin
                             in
                             TextureLoaded
-                                { center = center
+                                { -- We want to track the "center of mass" of all of our map markers and offset their positions by it (and then reverse that offset in our view matrix) so that we don't have really large values for the vertex positions. If we didn't do this then when zooming in a lot the vertices would start to jump around erratically due to rounding errors in the vertex shaders (floats in GLSL have less precision than in JS)
+                                  center = center
                                 , texture = texture
                                 , mesh =
-                                    List.indexedMap (lngLatToQuad (CssPixels.cssPixels 60) aspectRatio center) points
+                                    List.indexedMap (lngLatToQuad (CssPixels.cssPixels 60) aspectRatio center) mapMarkerPoints
                                         |> List.concat
                                         |> quadsToMesh
                                 }
