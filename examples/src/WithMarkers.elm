@@ -11,7 +11,7 @@ import Html exposing (Html)
 import Html.Attributes
 import List.Extra
 import LngLat exposing (LngLat)
-import MapViewer exposing (MapCoordinates)
+import MapViewer exposing (CanvasCoordinates, MapCoordinates)
 import Math.Matrix4 exposing (Mat4)
 import Math.Vector2 as Vec2 exposing (Vec2)
 import Math.Vector3 as Vec3 exposing (Vec3)
@@ -111,9 +111,8 @@ init _ =
 points : List LngLat
 points =
     [ { lng = Angle.degrees 0, lat = Angle.degrees 40 }
-
-    --, { lng = Angle.degrees 0.1, lat = Angle.degrees 40.1 }
-    --, { lng = Angle.degrees 0.2, lat = Angle.degrees 40.2 }
+    , { lng = Angle.degrees 0.1, lat = Angle.degrees 40.1 }
+    , { lng = Angle.degrees 0.2, lat = Angle.degrees 40.2 }
     ]
 
 
@@ -177,37 +176,9 @@ update msg model =
                         Just (MapViewer.PointerPressed _) ->
                             model.selectedMapMarker
 
-                        Just (MapViewer.PointerReleased { worldPosition, dragDistance }) ->
+                        Just (MapViewer.PointerReleased { canvasPosition, dragDistance }) ->
                             if dragDistance |> Quantity.lessThan (CssPixels.cssPixels 16) then
-                                let
-                                    zoom =
-                                        MapViewer.viewZoom newModel
-                                in
-                                List.reverse points
-                                    |> List.Extra.findIndex
-                                        (\latLng ->
-                                            let
-                                                point =
-                                                    MapViewer.lngLatToWorld latLng
-                                            in
-                                            case Direction2d.from worldPosition point of
-                                                Just direction ->
-                                                    --let
-                                                    --    distance : Quantity Float Unitless
-                                                    --    distance =
-                                                    --        MapViewer.canvasToWorld
-                                                    --            Point2d.distanceFrom
-                                                    --            canvasPosition
-                                                    --            point
-                                                    --            |> Debug.log "a"
-                                                    --in
-                                                    Direction2d.angleFrom Direction2d.y direction
-                                                        |> Quantity.abs
-                                                        |> Quantity.lessThan (Angle.degrees 24)
-
-                                                Nothing ->
-                                                    True
-                                        )
+                                List.Extra.findIndex (insideMapMarker newModel canvasPosition) points
 
                             else
                                 model.selectedMapMarker
@@ -249,6 +220,48 @@ update msg model =
               }
             , Cmd.none
             )
+
+
+{-| Detect if a point is inside the map marker shape. It's not pixel perfect but close enough.
+-}
+insideMapMarker : MapViewer.Model -> Point2d CssPixels CanvasCoordinates -> LngLat -> Bool
+insideMapMarker mapModel point mapMarkerPos =
+    let
+        markerCanvasPos : Point2d CssPixels CanvasCoordinates
+        markerCanvasPos =
+            MapViewer.lngLatToWorld mapMarkerPos |> MapViewer.worldToCanvas mapModel
+    in
+    case Direction2d.from point markerCanvasPos of
+        Just direction ->
+            let
+                distance : Quantity Float CssPixels
+                distance =
+                    Point2d.distanceFrom markerCanvasPos point
+
+                distance2 : Quantity Float CssPixels
+                distance2 =
+                    Point2d.distanceFrom
+                        (Point2d.translateBy
+                            (Vector2d.fromTuple CssPixels.cssPixels ( 0, -42 ))
+                            markerCanvasPos
+                        )
+                        point
+
+                angleDiff =
+                    Direction2d.angleFrom Direction2d.y direction
+                        |> Quantity.abs
+
+                isInsidePointyBit =
+                    (angleDiff |> Quantity.lessThan (Angle.degrees 24))
+                        && (distance |> Quantity.lessThan (CssPixels.cssPixels 45))
+
+                isInsideCircleBit =
+                    distance2 |> Quantity.lessThan (CssPixels.cssPixels 15)
+            in
+            isInsidePointyBit || isInsideCircleBit
+
+        Nothing ->
+            True
 
 
 quadsToMesh : List a -> WebGL.Mesh a

@@ -4,7 +4,7 @@ module MapViewer exposing
     , defaultStyle, rgb, Style, Color
     , animateZoom, animateZoomAt, animateViewBounds, withPositionAndZoom, viewPosition, viewZoom, viewportHeight, camera, lngLatToWorld, canvasToWorld, canvasSize, CanvasCoordinates
     , attribution, loadTile
-    , GridPoint, MapCoordinates, PointerEvent, ZoomAnimation(..), animateViewTo, cameraDistance, cameraDistanceWithZoomLevel, cameraFov, canvasToWorld_, currentAnimation, fontImageOptions, fragmentShader, getQuadIndices, vertexShader, viewWith, withViewBounds, worldToLngLat
+    , GridPoint, MapCoordinates, PointerEvent, ZoomAnimation(..), animateViewTo, cameraDistance, cameraDistanceWithZoomLevel, cameraFov, canvasToWorld_, currentAnimation, fontImageOptions, fragmentShader, getQuadIndices, vertexShader, viewWith, withViewBounds, worldToCanvas, worldToCanvas_, worldToLngLat
     )
 
 {-|
@@ -76,6 +76,7 @@ import Math.Vector4 as Vec4 exposing (Vec4)
 import Plane3d
 import Point2d exposing (Point2d)
 import Point3d
+import Point3d.Projection
 import Polyline2d
 import Process as Process
 import ProtobufDecode exposing (Decoder)
@@ -1055,7 +1056,14 @@ getViewportZoom devicePixelRatio_ canvasLength viewportHeight_ =
     canvasHeight / (tilePixelSize * viewportHeight_) |> ZoomLevel.fromLinearZoom
 
 
-canvasToWorld_ : ZoomLevel -> Point2d Unitless MapCoordinates -> Model -> Point2d CssPixels CanvasCoordinates -> Point2d Unitless MapCoordinates
+{-| Convert a world position to a canvas position with a given zoom and view position.
+-}
+canvasToWorld_ :
+    ZoomLevel
+    -> Point2d Unitless MapCoordinates
+    -> Model
+    -> Point2d CssPixels CanvasCoordinates
+    -> Point2d Unitless MapCoordinates
 canvasToWorld_ zoom viewPosition_ (Model model) screenPosition =
     let
         camera2 : Camera3d Unitless MapCoordinates
@@ -1075,6 +1083,42 @@ canvasToWorld_ zoom viewPosition_ (Model model) screenPosition =
         |> Axis3d.intersectionWithPlane Plane3d.xy
         |> Maybe.withDefault Point3d.origin
         |> (\p -> Point3d.toUnitless p |> (\a -> Point2d.unitless a.x a.y))
+
+
+{-| Convert a world position to a canvas position with a given zoom and view position.
+-}
+worldToCanvas_ :
+    ZoomLevel
+    -> Point2d Unitless MapCoordinates
+    -> Model
+    -> Point2d Unitless MapCoordinates
+    -> Point2d CssPixels CanvasCoordinates
+worldToCanvas_ zoom viewPosition_ (Model model) worldPosition =
+    let
+        camera2 : Camera3d Unitless MapCoordinates
+        camera2 =
+            camera_ viewPosition_ (viewportHeight model.devicePixelRatio model.canvasSize zoom)
+
+        ( canvasWidth, canvasHeight ) =
+            model.canvasSize
+
+        screenRectangle : Rectangle2d CssPixels CanvasCoordinates
+        screenRectangle =
+            Rectangle2d.from
+                (Point2d.xy Quantity.zero (Quantity.toFloatQuantity canvasHeight))
+                (Point2d.xy (Quantity.toFloatQuantity canvasWidth) Quantity.zero)
+
+        { x, y } =
+            Point2d.unwrap worldPosition
+    in
+    Point3d.Projection.toScreenSpace camera2 screenRectangle (Point3d.unsafe { x = x, y = y, z = 0 })
+
+
+{-| Convert a world position to a canvas position.
+-}
+worldToCanvas : Model -> Point2d Unitless MapCoordinates -> Point2d CssPixels CanvasCoordinates
+worldToCanvas (Model model) worldPosition =
+    worldToCanvas_ model.viewZoom model.viewPosition (Model model) worldPosition
 
 
 {-| Convert a canvas position to a world position.
