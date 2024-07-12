@@ -1,4 +1,4 @@
-module Main exposing (main)
+module Basic exposing (main)
 
 import Angle
 import Browser

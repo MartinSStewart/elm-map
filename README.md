@@ -6,6 +6,15 @@ This package has no JS dependencies meaning you don't need to mess with ports or
 
 [Here's an example of it in action.](https://realia.se/map?a=AQADAAAAAAAAAAAAAAAAAAAAAEAIAAAAAAAAAAEAAAAXS3VuZ3NnYXRhbiAxLCBTdG9ja2hvbG0AAAAXS3VuZ3NnYXRhbiAxLCBTdG9ja2hvbG0AAAAAAHBFaUJMZFc1bmMyZGhkR0Z1SURFc0lGTjBiMk5yYUc5c2JTd2dVM1psY21sblpTSXdFaTRLRkFvU0NlVzBzNVZjblY5R0VXT0tkNVpnVUtZbEVBRXFGQW9TQ1gwTXhVcG5uVjlHRWNxTVpVVUNVZF9PAAAAAABwRWlCTGRXNW5jMmRoZEdGdUlERXNJRk4wYjJOcmFHOXNiU3dnVTNabGNtbG5aU0l3RWk0S0ZBb1NDZVcwczVWY25WOUdFV09LZDVaZ1VLWWxFQUVxRkFvU0NYME14VXBublY5R0VjcU1aVVVDVWRfTwADAAAAAw)
 
+## Viewing examples
+
+To view the example maps run the following commands in your terminal
+```
+cd examples
+elm reactor
+```
+and then open localhost:8000 in your browser and select the module you want to view
+
 ## Caveats
 
 This map viewer doesn't have many of the features and styling options other map viewers like Mapbox offer. While some features don't exist simply because I haven't had time to add them, I suspect everyone will have their own specific use cases that will be difficult for this package to completely satisfy without making it difficult to use and a lot slower.
