@@ -4,6 +4,7 @@ import Angle
 import Browser
 import CssPixels
 import Html exposing (Html)
+import Html.Attributes
 import Http
 import MapViewer
 import Pixels

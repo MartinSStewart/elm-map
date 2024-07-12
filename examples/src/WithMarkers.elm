@@ -2,19 +2,24 @@ module WithMarkers exposing (main)
 
 import Angle
 import Browser
+import Browser.Events
 import Camera3d exposing (Camera3d)
-import CssPixels
+import CssPixels exposing (CssPixels)
+import Direction2d
 import Geometry.Interop.LinearAlgebra.Point2d as Point2d
 import Html exposing (Html)
+import Html.Attributes
+import List.Extra
 import LngLat exposing (LngLat)
-import MapViewer exposing (MapCoordinates)
+import MapViewer exposing (CanvasCoordinates, MapCoordinates)
 import Math.Matrix4 exposing (Mat4)
 import Math.Vector2 as Vec2 exposing (Vec2)
 import Math.Vector3 as Vec3 exposing (Vec3)
 import Math.Vector4 exposing (Vec4)
 import Point2d exposing (Point2d)
-import Quantity exposing (Unitless)
+import Quantity exposing (Quantity, Unitless)
 import Task
+import Vector2d
 import WebGL exposing (Shader)
 import WebGL.Matrices
 import WebGL.Settings.Blend as Blend
@@ -26,6 +31,7 @@ type alias Model =
     { map : MapViewer.Model
     , mapData : MapViewer.MapData
     , mapMarkers : MapMarkers
+    , selectedMapMarker : Maybe Int
     }
 
 
@@ -88,6 +94,7 @@ init _ =
                 }
                 MapViewer.defaultStyle
       , mapMarkers = TextureLoading
+      , selectedMapMarker = Just 1
       }
     , WebGL.Texture.loadWith
         { magnify = WebGL.Texture.linear
@@ -109,32 +116,47 @@ points =
     ]
 
 
-lngLatToQuad : Float -> Float -> LngLat -> List MapMarkerVertex
-lngLatToQuad size aspectRatio lngLat =
+lngLatToQuad :
+    Quantity Float CssPixels
+    -> Float
+    -> Point2d Unitless MapCoordinates
+    -> Int
+    -> LngLat
+    -> List MapMarkerVertex
+lngLatToQuad height aspectRatio center id lngLat =
     let
         position =
-            MapViewer.lngLatToWorld lngLat |> Point2d.toVec2
+            MapViewer.lngLatToWorld lngLat
+                |> Point2d.translateBy (Vector2d.from center Point2d.origin)
+                |> Point2d.toVec2
 
         color =
             Vec3.vec3 1 0 0
+
+        size2 =
+            Quantity.ratio height (Tuple.second canvasSize) * 2
     in
-    [ { position = position
-      , offset = Vec2.vec2 (-size * aspectRatio / 2) size
+    [ { id = toFloat id
+      , position = position
+      , offset = Vec2.vec2 (-size2 * aspectRatio / 2) size2
       , texPosition = Vec2.vec2 0 1
       , color = color
       }
-    , { position = position
-      , offset = Vec2.vec2 (size * aspectRatio / 2) size
+    , { id = toFloat id
+      , position = position
+      , offset = Vec2.vec2 (size2 * aspectRatio / 2) size2
       , texPosition = Vec2.vec2 1 1
       , color = color
       }
-    , { position = position
-      , offset = Vec2.vec2 (size * aspectRatio / 2) 0
+    , { id = toFloat id
+      , position = position
+      , offset = Vec2.vec2 (size2 * aspectRatio / 2) 0
       , texPosition = Vec2.vec2 1 0
       , color = color
       }
-    , { position = position
-      , offset = Vec2.vec2 (-size * aspectRatio / 2) 0
+    , { id = toFloat id
+      , position = position
+      , offset = Vec2.vec2 (-size2 * aspectRatio / 2) 0
       , texPosition = Vec2.vec2 0 0
       , color = color
       }
@@ -148,8 +170,25 @@ update msg model =
             let
                 { newModel, newMapData, outMsg, cmd } =
                     MapViewer.update mapboxApiKey model.mapData mapMsg model.map
+
+                maybeSelected =
+                    case outMsg of
+                        Just (MapViewer.PointerPressed _) ->
+                            model.selectedMapMarker
+
+                        Just (MapViewer.PointerReleased { canvasPosition, dragDistance }) ->
+                            if dragDistance |> Quantity.lessThan (CssPixels.cssPixels 16) then
+                                List.Extra.findIndex (insideMapMarker newModel canvasPosition) points
+
+                            else
+                                model.selectedMapMarker
+
+                        Nothing ->
+                            model.selectedMapMarker
             in
-            ( { model | map = newModel, mapData = newMapData }, Cmd.map MapMsg cmd )
+            ( { model | map = newModel, mapData = newMapData, selectedMapMarker = maybeSelected }
+            , Cmd.map MapMsg cmd
+            )
 
         GotMapMarkerTexture result ->
             ( { model
@@ -162,13 +201,18 @@ update msg model =
 
                                 aspectRatio =
                                     toFloat textureWidth / toFloat textureHeight
-                            in
-                            TextureLoaded
-                                { center =
+
+                                center =
                                     Point2d.centroidN (List.map MapViewer.lngLatToWorld points)
                                         |> Maybe.withDefault Point2d.origin
+                            in
+                            TextureLoaded
+                                { center = center
                                 , texture = texture
-                                , mesh = List.concatMap (lngLatToQuad 0.2 aspectRatio) points |> quadsToMesh
+                                , mesh =
+                                    List.indexedMap (lngLatToQuad (CssPixels.cssPixels 60) aspectRatio center) points
+                                        |> List.concat
+                                        |> quadsToMesh
                                 }
 
                         Err error ->
@@ -176,6 +220,48 @@ update msg model =
               }
             , Cmd.none
             )
+
+
+{-| Detect if a point is inside the map marker shape. It's not pixel perfect but close enough.
+-}
+insideMapMarker : MapViewer.Model -> Point2d CssPixels CanvasCoordinates -> LngLat -> Bool
+insideMapMarker mapModel point mapMarkerPos =
+    let
+        markerCanvasPos : Point2d CssPixels CanvasCoordinates
+        markerCanvasPos =
+            MapViewer.lngLatToWorld mapMarkerPos |> MapViewer.worldToCanvas mapModel
+    in
+    case Direction2d.from point markerCanvasPos of
+        Just direction ->
+            let
+                distance : Quantity Float CssPixels
+                distance =
+                    Point2d.distanceFrom markerCanvasPos point
+
+                distance2 : Quantity Float CssPixels
+                distance2 =
+                    Point2d.distanceFrom
+                        (Point2d.translateBy
+                            (Vector2d.fromTuple CssPixels.cssPixels ( 0, -42 ))
+                            markerCanvasPos
+                        )
+                        point
+
+                angleDiff =
+                    Direction2d.angleFrom Direction2d.y direction
+                        |> Quantity.abs
+
+                isInsidePointyBit =
+                    (angleDiff |> Quantity.lessThan (Angle.degrees 24))
+                        && (distance |> Quantity.lessThan (CssPixels.cssPixels 45))
+
+                isInsideCircleBit =
+                    distance2 |> Quantity.lessThan (CssPixels.cssPixels 15)
+            in
+            isInsidePointyBit || isInsideCircleBit
+
+        Nothing ->
+            True
 
 
 quadsToMesh : List a -> WebGL.Mesh a
@@ -251,15 +337,21 @@ view model =
                                 , farClipDepth = Quantity.float (1000 / zoom)
                                 , aspectRatio = aspectRatio
                                 }
-
-                        --|> Math.Matrix4.translate3 x y 0
+                                |> Math.Matrix4.translate3 x y 0
                     in
                     [ WebGL.entityWith
                         [ Blend.add Blend.srcAlpha Blend.oneMinusSrcAlpha ]
                         mapMarkerVertexShader
                         mapMarkerFragmentShader
                         mesh
-                        { view = cameraMatrix
+                        { selectedId =
+                            case model.selectedMapMarker of
+                                Just index ->
+                                    toFloat index
+
+                                Nothing ->
+                                    -1
+                        , view = cameraMatrix
                         , aspect = aspectRatio
                         , texture = texture
                         , zoom = MapViewer.viewZoom model.map |> ZoomLevel.toLinearZoom
@@ -279,7 +371,8 @@ view model =
 
 
 type alias MapMarkerVertex =
-    { position : Vec2
+    { id : Float
+    , position : Vec2
     , offset : Vec2
     , texPosition : Vec2
     , color : Vec3
@@ -289,14 +382,16 @@ type alias MapMarkerVertex =
 mapMarkerVertexShader :
     Shader
         MapMarkerVertex
-        { u | view : Mat4, aspect : Float, zoom : Float }
+        { u | selectedId : Float, view : Mat4, aspect : Float, zoom : Float }
         { vColor : Vec4, vTexPosition : Vec2 }
 mapMarkerVertexShader =
     [glsl|
+attribute float id;
 attribute vec2 position;
 attribute vec2 texPosition;
 attribute vec2 offset;
 attribute vec3 color;
+uniform float selectedId;
 uniform mat4 view;
 uniform float aspect;
 uniform float zoom;
@@ -308,7 +403,10 @@ void main () {
     vec4 currentProjected = view * vec4(position, 0.0, 1.0);
     gl_Position = currentProjected + vec4( vec2(offset.x / aspect,offset.y) * currentProjected.w, 0.0, 0.0);
     vTexPosition = texPosition;
-    vColor = vec4(color, 1.0);
+    vColor =
+        id == selectedId
+            ? vec4(1.0, 1.0, 1.0, 1.0)
+            : vec4(color, 1.0);
 }
 |]
 
