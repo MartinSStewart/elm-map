@@ -4,7 +4,7 @@ module MapViewer exposing
     , defaultStyle, rgb, Style, Color
     , animateZoom, animateZoomAt, animateViewBounds, withPositionAndZoom, viewPosition, viewZoom, viewportHeight, camera, lngLatToWorld, canvasToWorld, canvasSize, CanvasCoordinates
     , attribution, loadTile
-    , GridPoint, MapCoordinates, PointerEvent, ZoomAnimation(..), animateViewTo, cameraDistance, cameraDistanceWithZoomLevel, cameraFov, canvasToWorld_, currentAnimation, fontImageOptions, fragmentShader, getQuadIndices, screenToWorld, vertexShader, viewWith, withViewBounds, worldToLngLat
+    , GridPoint, MapCoordinates, PointerEvent, ZoomAnimation(..), animateViewTo, cameraDistance, cameraDistanceWithZoomLevel, cameraFov, canvasToWorld_, currentAnimation, fontImageOptions, fragmentShader, getQuadIndices, vertexShader, viewWith, withViewBounds, worldToLngLat
     )
 
 {-|
@@ -66,8 +66,8 @@ import Html.Events.Extra.Touch
 import Html.Events.Extra.Wheel
 import Http as Http
 import Int64 exposing (Int64)
-import List.Extra
 import List.Nonempty exposing (Nonempty(..))
+import ListExtra
 import LngLat exposing (LngLat)
 import Math.Matrix4 exposing (Mat4)
 import Math.Vector2 exposing (Vec2)
@@ -1055,11 +1055,6 @@ getViewportZoom devicePixelRatio_ canvasLength viewportHeight_ =
     canvasHeight / (tilePixelSize * viewportHeight_) |> ZoomLevel.fromLinearZoom
 
 
-screenToWorld : Model -> Point2d CssPixels CanvasCoordinates -> Point2d Unitless MapCoordinates
-screenToWorld (Model model) screenPosition =
-    canvasToWorld_ model.viewZoom model.viewPosition (Model model) screenPosition
-
-
 canvasToWorld_ : ZoomLevel -> Point2d Unitless MapCoordinates -> Model -> Point2d CssPixels CanvasCoordinates -> Point2d Unitless MapCoordinates
 canvasToWorld_ zoom viewPosition_ (Model model) screenPosition =
     let
@@ -1795,7 +1790,7 @@ canvasSize (Model model) =
         findValue value =
             List.range 0 9
                 |> List.map ((+) (CssPixels.inCssPixels value))
-                |> List.Extra.find
+                |> ListExtra.find
                     (\v ->
                         let
                             a =
@@ -1969,7 +1964,7 @@ viewWith config extraLayers onMapMsg (MapData mapData) (Model model) =
                         else
                             Nothing
                     )
-                |> List.Extra.gatherEqualsBy .zoom
+                |> ListExtra.gatherEqualsBy .zoom
                 |> List.sortBy (Tuple.first >> .zoom)
                 |> List.map (\( head, rest ) -> head :: rest)
 
@@ -2866,7 +2861,7 @@ decodeBuildingGeometry feature builder =
 
 getTags : { a | keys : Array String, values : Array Value } -> { b | tags : List Int } -> Dict String Value
 getTags layer feature =
-    List.Extra.groupsOf 2 feature.tags
+    ListExtra.groupsOf 2 feature.tags
         |> List.map
             (\list ->
                 case list of

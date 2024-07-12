@@ -1,4 +1,4 @@
-module List.Extra exposing (find, gatherEqualsBy, gatherWith, groupsOf, groupsOfWithStep, remove, uniqueBy)
+module ListExtra exposing (find, gatherEqualsBy, gatherWith, groupsOf, groupsOfWithStep, remove, uniqueBy)
 
 {-| Since `elm-community/list-extra` changes major versions often and we only need a few functions, it's better to copy them here and add a dependency to `elm-community/list-extra`
 -}
