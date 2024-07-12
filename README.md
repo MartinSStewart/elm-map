@@ -23,6 +23,15 @@ For that reason, I recommend cloning this package and changing it to suit your n
 
 Also, people I've shown the map viewer to (around half) report that it's laggy on their device. No one has said it's unusably laggy but it's still not ideal. Performance improvements are ongoing but I recommend trying out the example viewer and deciding for yourself if the performance is good enough for your use case.
 
+## Generating a custom font
+
+If you want to use a font other than dinProMedium then do the following steps:
+1. Download and run http://www.angelcode.com/products/bmfont/ (windows only, sorry)
+2. Options -> Load Configuration and select the `bm-font-config.bmfc` file found in this repo
+3. Options -> Font settings and pick the font you want to use from the dropdown
+4. Options -> Save bitmap font as...
+5. Update your Elm code to this `MapViewer.initMapData { fntPath = <path to fnt file> , imagePath = <path to png file> }`
+
 ## Special thanks
 
 Thanks to [realia.se](https://realia.se/) for letting me implement this during work hours!
